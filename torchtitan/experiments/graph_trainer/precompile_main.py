@@ -16,6 +16,7 @@ Usage:
     python -m torchtitan.experiments.graph_trainer.precompile_main \
         --module graph_trainer.llama3 \
         --config graph_trainer_llama3_debugmodel \
+        --compile.mode aot \
         --compile.passes full_inductor_compilation \
         --compile.joint_passes inductor_decomposition \
         --compile.precompile_artifact_dir /tmp/precompile_artifacts
@@ -57,6 +58,11 @@ def main():
 
     compile_config = config.compile
 
+    if compile_config.mode != "aot":
+        raise ValueError(
+            "precompile_main requires --compile.mode=aot. "
+            f"Got '{compile_config.mode}'."
+        )
     if not compile_config.precompile_artifact_dir:
         raise ValueError(
             "precompile_main requires --compile.precompile_artifact_dir to be set."
