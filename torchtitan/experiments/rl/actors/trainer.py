@@ -81,7 +81,7 @@ class PolicyTrainer(Actor, Configurable):
         transfer_dtype: str = "",
     ):
         self.config = config
-        self.loss_fn = config.loss.build()
+        self.loss_fn = config.loss.build(compile_config=config.compile)
         self.model_spec = model_spec
         # Only cast if transfer dtype differs from training dtype, otherwise
         # staging buffers would be allocated for a no-op cast.
@@ -333,7 +333,7 @@ class PolicyTrainer(Actor, Configurable):
                     all_ref_logprobs, seq_lens, prompt_lens, response_lens
                 )
 
-        loss, loss_metrics = self.loss_fn(
+        loss, loss_metric_tensors = self.loss_fn(
             policy_logprobs=policy_logprobs,
             advantages=advantages,
             ref_logprobs=ref_logprobs,
@@ -368,6 +368,10 @@ class PolicyTrainer(Actor, Configurable):
         self.lr_schedulers.step()
 
         self.policy_version += 1
+
+        # Finalize loss metrics after backward so the GPU→CPU sync overlaps
+        # with the backward+optimizer work instead of stalling forward.
+        loss_metrics = {k: v.item() for k, v in loss_metric_tensors.items()}
 
         # Return metrics
         metrics = {

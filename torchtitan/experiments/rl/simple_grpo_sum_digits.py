@@ -35,8 +35,9 @@ import torch
 import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
+from torch.nn.utils.rnn import pad_sequence
 
-from torchtitan.config import Configurable, ParallelismConfig
+from torchtitan.config import CompileConfig, Configurable, ParallelismConfig
 from torchtitan.config.manager import ConfigManager
 from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.grader import Grader
@@ -46,6 +47,59 @@ from torchtitan.experiments.rl.types import Episode, TrainBatch
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+
+def _grpo_loss_fn(
+    policy_log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    lengths: torch.Tensor,
+    advantages: torch.Tensor,
+    kl_coef: float,
+    clip_eps: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compile-friendly clipped GRPO loss on padded tensors.
+
+    The mask is built inside the compiled region so it fuses with the
+    downstream arithmetic. Metrics are returned as on-device tensors;
+    the caller should ``.item()`` them after ``loss.backward()`` so the
+    GPU→CPU sync overlaps with the backward pass instead of stalling it.
+
+    Returns:
+        (total_loss, metrics) — metrics values are 0-d tensors.
+    """
+    max_len = policy_log_probs.shape[1]
+    mask = (
+        torch.arange(max_len, device=policy_log_probs.device).unsqueeze(0)
+        < lengths.unsqueeze(1)
+    ).to(policy_log_probs.dtype)
+
+    # Per-token log ratio, zeroed at padding positions so they don't bias the mean
+    token_log_ratio = (policy_log_probs - ref_log_probs) * mask
+    token_counts = mask.sum(dim=1).clamp(min=1)
+    mean_log_ratio = token_log_ratio.sum(dim=1) / token_counts
+
+    # Schulman KL approximation (ratio - 1 - log_ratio), masked
+    token_ratio = torch.exp(token_log_ratio)
+    token_kl = (token_ratio - 1 - token_log_ratio) * mask
+    mean_kl = token_kl.sum(dim=1) / token_counts
+
+    # PPO clipped objective
+    ratio = torch.exp(mean_log_ratio)
+    unclipped_loss = ratio * advantages
+    clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+    clipped_loss = clipped_ratio * advantages
+    pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+
+    kl_div = mean_kl.mean()
+    total_loss = pg_loss + kl_coef * kl_div
+
+    metrics = {
+        "pg_loss": pg_loss,
+        "kl_div": kl_div,
+        "ratio_mean": ratio.mean(),
+        "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6).float().mean(),
+    }
+    return total_loss, metrics
 
 
 class GRPOLoss(Configurable):
@@ -62,54 +116,83 @@ class GRPOLoss(Configurable):
         clip_eps: float = 0.2
         """PPO clipping epsilon for the probability ratio."""
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        compile_config: CompileConfig | None = None,
+    ):
         self.kl_coef = config.kl_coef
         self.clip_eps = config.clip_eps
+
+        loss_fn = _grpo_loss_fn
+        self._compiled = (
+            compile_config is not None
+            and compile_config.enable
+            and "loss" in compile_config.components
+        )
+        if self._compiled:
+            logger.info("Compiling GRPO loss with torch.compile")
+            loss_fn = torch.compile(loss_fn, backend=compile_config.backend)
+        self._loss_fn = loss_fn
 
     def __call__(
         self,
         policy_logprobs: list[torch.Tensor],
         advantages: torch.Tensor,
         ref_logprobs: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        per_sample_mean_log_ratio = []
-        per_sample_mean_kl = []
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Returns ``(total_loss, metrics)`` with metrics as on-device tensors.
 
+        The caller should ``.item()`` the metric values *after*
+        ``loss.backward()`` so the GPU→CPU sync overlaps with the
+        backward pass instead of stalling it.
+        """
+        device = advantages.device
+
+        # Pad variable-length response log probs into [batch, max_gen_len].
+        # Padding value 0.0 is zeroed out by the mask inside the loss fn.
+        policy_log_probs_padded = pad_sequence(
+            policy_logprobs, batch_first=True, padding_value=0.0
+        )
         if ref_logprobs is not None:
-            for policy_lps, ref_lps in zip(policy_logprobs, ref_logprobs):
-                token_log_ratio = policy_lps - ref_lps.detach()
-                per_sample_mean_log_ratio.append(token_log_ratio.mean())
-
-                token_ratio = torch.exp(token_log_ratio)
-                token_kl = token_ratio - 1 - token_log_ratio
-                per_sample_mean_kl.append(token_kl.mean())
+            ref_log_probs_padded = pad_sequence(
+                [r.detach() for r in ref_logprobs],
+                batch_first=True,
+                padding_value=0.0,
+            )
         else:
-            for policy_lps in policy_logprobs:
-                per_sample_mean_log_ratio.append(policy_lps.mean())
+            # No reference: log_ratio collapses to policy_lps (matches the
+            # original eager behavior when ref_logprobs is None).
+            ref_log_probs_padded = torch.zeros_like(policy_log_probs_padded)
 
-        mean_log_ratio = torch.stack(per_sample_mean_log_ratio)
-        ratio = torch.exp(mean_log_ratio)
+        lengths = torch.tensor([t.shape[0] for t in policy_logprobs], device=device)
 
-        unclipped_loss = ratio * advantages
-        clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
-        clipped_loss = clipped_ratio * advantages
-        pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+        # Pre-declare batch and seq dims dynamic so the compiled graph covers
+        # all shape variations with a single compile instead of re-specializing.
+        if self._compiled:
+            for t in (policy_log_probs_padded, ref_log_probs_padded):
+                torch._dynamo.mark_dynamic(t, 0)
+                torch._dynamo.mark_dynamic(t, 1)
+            torch._dynamo.mark_dynamic(lengths, 0)
+            torch._dynamo.mark_dynamic(advantages, 0)
 
-        kl_div = torch.tensor(0.0)
-        if per_sample_mean_kl:
-            kl_div = torch.stack(per_sample_mean_kl).mean()
+        # Zero out kl_coef when there's no ref model so the spurious
+        # Schulman-approx KL against zeros doesn't leak into the loss.
+        kl_coef = self.kl_coef if ref_logprobs is not None else 0.0
+        total_loss, metrics = self._loss_fn(
+            policy_log_probs_padded,
+            ref_log_probs_padded,
+            lengths,
+            advantages,
+            kl_coef,
+            self.clip_eps,
+        )
 
-        loss = pg_loss + self.kl_coef * kl_div
-        metrics = {
-            "pg_loss": pg_loss.item(),
-            "kl_div": kl_div.item(),
-            "ratio_mean": ratio.mean().item(),
-            "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6)
-            .float()
-            .mean()
-            .item(),
-        }
-        return loss, metrics
+        if ref_logprobs is None:
+            # KL is meaningless without a reference; zero it for the log.
+            metrics = {**metrics, "kl_div": torch.zeros_like(metrics["kl_div"])}
+        return total_loss, metrics
 
 
 class Provisioner:
