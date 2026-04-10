@@ -36,6 +36,7 @@ from torchtitan.distributed.compile import apply_compile_dense
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
+from torchtitan.models.common.feed_forward import FusedFeedForward
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
@@ -235,10 +236,16 @@ def apply_tp(
                 input_layouts=(sp_layout,),
                 desired_input_layouts=(Replicate(),),
             ),
-            "feed_forward.w1": colwise_parallel(),
-            "feed_forward.w2": rowwise_output_plan,
-            "feed_forward.w3": colwise_parallel(),
         }
+
+        # pyrefly: ignore [missing-attribute]
+        if isinstance(transformer_block.feed_forward, FusedFeedForward):
+            layer_plan["feed_forward.w13"] = colwise_parallel()
+            layer_plan["feed_forward.w2"] = rowwise_output_plan
+        else:
+            layer_plan["feed_forward.w1"] = colwise_parallel()
+            layer_plan["feed_forward.w2"] = rowwise_output_plan
+            layer_plan["feed_forward.w3"] = colwise_parallel()
 
         parallelize_module(
             # pyrefly: ignore [bad-argument-type]
