@@ -36,7 +36,7 @@ from torch.fx.passes.regional_inductor import regional_inductor
 from torch.utils.checkpoint import CheckpointPolicy
 
 from torchtitan.distributed.activation_checkpoint import _get_save_ops
-from torchtitan.experiments.graph_trainer.common_utils import _AC_REGION_ID
+from torchtitan.experiments.graph_trainer.common_utils import _AC_REGION_ID, _MODULE_FQN
 from torchtitan.experiments.graph_trainer.custom_codegen import custom_codegen_pass
 from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
@@ -66,6 +66,9 @@ def compile_time_passes(
     cudagraph is excluded because it needs to re-capture the graph into
     an in-memory CUDA graph at runtime
     """
+    from torchtitan.experiments.graph_trainer.common_utils import (
+        get_transformer_block_buckets,
+    )
     from torchtitan.models.common.attention import FlexAttention
 
     return [
@@ -74,6 +77,10 @@ def compile_time_passes(
         remove_identity_view_pass,
         remove_identity_slice_pass,
         selective_activation_remat_pass,
+        functools.partial(
+            joint_transformer_block_bucketing_reordering_pass,
+            fsdp_manual_buckets=get_transformer_block_buckets(traced_result.model),
+        ),
         # FlexAttention HOPs must be compiled (via regional_inductor) to
         # produce bitwise identical results to the eager Trainer path.
         # When left uncompiled, flex_attention still runs correctly but
@@ -173,6 +180,62 @@ def transformer_block_bucketing_reordering_pass(
     manual_overlap_bucketing(
         gm, module_bucket_plans=fsdp_manual_buckets, insert_overlap_deps=False
     )
+    gm.recompile()
+    return gm
+
+
+def joint_transformer_block_bucketing_reordering_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+    *,
+    fsdp_manual_buckets,
+) -> torch.fx.GraphModule:
+    """Apply manual bucketing and reordering on a joint fwd+bwd graph.
+
+    The joint graph is processed in two passes to ensure each direction's
+    collectives are bucketed independently and reordering uses the correct
+    execution order (forward order for fwd, reversed order for bwd).
+
+    Used by the aot_fx_trace mode where forward and backward are in a
+    single graph.
+    """
+
+    def _make_module_fqn_stack_fn(
+        *, bwd: bool
+    ) -> Callable[[torch.fx.Node], list[tuple[str, type]]]:
+        """Create a module_stack_fn that filters nodes by forward/backward direction."""
+
+        def _stack_fn(node: torch.fx.Node) -> list[tuple[str, type]]:
+            is_bwd = node.meta.get("autograd_backward", False)
+            if is_bwd != bwd:
+                return []
+            fqn = node.meta.get("custom", {}).get(_MODULE_FQN)
+            if not fqn:
+                return []
+            return [(fqn, torch.nn.Module)]
+
+        return _stack_fn
+
+    # Forward pass: bucket and reorder in forward execution order
+    manual_overlap_bucketing(
+        gm,
+        module_bucket_plans=fsdp_manual_buckets,
+        insert_overlap_deps=False,
+        module_stack_fn=_make_module_fqn_stack_fn(bwd=False),
+    )
+
+    # keep it until https://github.com/pytorch/pytorch/pull/180579 lands
+    for node in gm.graph.nodes:
+        node.meta.pop("manual_bucket_node_type", None)
+
+    # Backward pass: bucket and reorder backward collectives separately
+    manual_overlap_bucketing(
+        gm,
+        module_bucket_plans=fsdp_manual_buckets,
+        insert_overlap_deps=False,
+        module_stack_fn=_make_module_fqn_stack_fn(bwd=True),
+    )
+
     gm.recompile()
     return gm
 
