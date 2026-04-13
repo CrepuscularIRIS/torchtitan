@@ -3,8 +3,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch.nn as nn
 
@@ -30,6 +31,32 @@ class ModelConverter(Protocol):
     def post_optimizer_hook(self, model: nn.Module | list[nn.Module]):
         """Post-optimizer (optional) hook (e.g. compute weights statistics)."""
         ...
+
+    def key_filter(self) -> Callable[[str], bool] | None:
+        """Return a filter that identifies state dict keys owned by this converter.
+
+        The returned callable takes a key name and returns ``True`` if the
+        key belongs to this converter.  Return ``None`` if the converter
+        doesn't introduce new keys.
+
+        Used by ``ModelWrapper`` to split state dicts:
+        - ``StateDictMode.BASE`` excludes all converter-owned keys (for HF containers)
+        """
+        return None
+
+    def state_dict_transform(
+        self,
+    ) -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+        """Return a transform applied to the model state dict for export saves.
+
+        The returned callable takes a full state dict and returns a
+        (possibly filtered or modified) state dict.  Return ``None`` to
+        indicate no transform (the full state dict is used as-is).
+
+        This is only called for last-step / model-only saves, not for
+        interval resume checkpoints.
+        """
+        return None
 
 
 class ModelConvertersContainer(Configurable, ModelConverter):
@@ -79,6 +106,40 @@ class ModelConvertersContainer(Configurable, ModelConverter):
     def post_optimizer_hook(self, model: nn.Module | list[nn.Module]):
         for mh in self.converters:
             mh.post_optimizer_hook(model)
+
+    def state_dict_transform(
+        self,
+    ) -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+        """Compose state_dict_transform from all converters."""
+        transforms = [
+            t for c in self.converters if (t := c.state_dict_transform()) is not None
+        ]
+        if not transforms:
+            return None
+        if len(transforms) == 1:
+            return transforms[0]
+
+        def composed(sd: dict[str, Any]) -> dict[str, Any]:
+            # Reverse order: undo transforms in the opposite order they were
+            # applied during model construction (last converter undone first).
+            for t in reversed(transforms):
+                sd = t(sd)
+            return sd
+
+        return composed
+
+    def key_filter(self) -> Callable[[str], bool] | None:
+        """Compose key_filter from all converters (union / OR)."""
+        filters = [f for c in self.converters if (f := c.key_filter()) is not None]
+        if not filters:
+            return None
+        if len(filters) == 1:
+            return filters[0]
+
+        def composed(key: str) -> bool:
+            return any(f(key) for f in filters)
+
+        return composed
 
 
 def _validate_quantization(converters: list[Configurable.Config]):
