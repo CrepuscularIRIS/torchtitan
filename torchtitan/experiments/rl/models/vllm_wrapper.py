@@ -338,7 +338,7 @@ class TorchTitanVLLMModelWrapper(Module):
                 ],
             )
 
-        logits = self.model.output(hidden_states)
+        logits = self.model.lm_head(hidden_states)
 
         return logits
 

@@ -5,12 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TypeAlias
 
 import torch
 import torch.nn as nn
 
-from torchtitan.config import CompileConfig
+from torchtitan.config import CompileConfig, Configurable
 from torchtitan.tools.logging import logger
 
 # PyTorch's default ignore index for cross-entropy loss
@@ -19,18 +20,32 @@ IGNORE_INDEX = -100
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
-class CrossEntropyLoss:
-    """Cross-entropy loss with sum reduction for token-based normalization.
+def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy loss with sum reduction for token-based normalization."""
+    return torch.nn.functional.cross_entropy(
+        pred.flatten(0, 1).float(),
+        labels.flatten(0, 1),
+        reduction="sum",
+        ignore_index=IGNORE_INDEX,
+    )
 
-    This is the standard loss for autoregressive language model training.
-    Predictions are flattened from [B, L, V] to [B*L, V] and cast to float32.
-    Labels are flattened from [B, L] to [B*L]. Tokens with label == -100
-    (IGNORE_INDEX) are excluded from the loss.
-    """
 
-    def __init__(self, compile_config: CompileConfig | None = None):
-        self._fn: LossFunction = self._compute
-        self._scale: torch.Tensor | None = None
+def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Common MSE loss function with sum reduction for Transformer models training."""
+    return torch.nn.functional.mse_loss(
+        pred.float(), labels.float().detach(), reduction="sum"
+    )
+
+
+class CrossEntropyLoss(Configurable):
+    """Cross-entropy loss with sum reduction for token-based normalization."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+        self._fn: LossFunction = cross_entropy_loss
         if (
             compile_config is not None
             and compile_config.enable
@@ -39,32 +54,19 @@ class CrossEntropyLoss:
             logger.info("Compiling the loss function with torch.compile")
             self._fn = torch.compile(self._fn, backend=compile_config.backend)
 
-    def set_scale(self, scale: torch.Tensor) -> None:
-        """Set a scaling factor applied to the loss output."""
-        self._scale = scale
-
-    @staticmethod
-    def _compute(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.cross_entropy(
-            pred.flatten(0, 1).float(),
-            labels.flatten(0, 1),
-            reduction="sum",
-            ignore_index=IGNORE_INDEX,
-        )
-
     def __call__(self, pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        loss = self._fn(pred, labels)
-        if self._scale is not None:
-            loss = loss * self._scale
-        return loss
+        return self._fn(pred, labels)
 
 
-class MSELoss:
+class MSELoss(Configurable):
     """MSE loss with sum reduction for Transformer models training (e.g. Flux)."""
 
-    def __init__(self, compile_config: CompileConfig | None = None):
-        self._fn: LossFunction = self._compute
-        self._scale: torch.Tensor | None = None
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+        self._fn: LossFunction = mse_loss
         if (
             compile_config is not None
             and compile_config.enable
@@ -73,39 +75,8 @@ class MSELoss:
             logger.info("Compiling the loss function with torch.compile")
             self._fn = torch.compile(self._fn, backend=compile_config.backend)
 
-    def set_scale(self, scale: torch.Tensor) -> None:
-        """Set a scaling factor applied to the loss output."""
-        self._scale = scale
-
-    @staticmethod
-    def _compute(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.mse_loss(
-            pred.float(), labels.float().detach(), reduction="sum"
-        )
-
     def __call__(self, pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        loss = self._fn(pred, labels)
-        if self._scale is not None:
-            loss = loss * self._scale
-        return loss
-
-
-# Standalone functions for use in tests and experiments that don't need
-# the compile-aware class wrapper.
-cross_entropy_loss = CrossEntropyLoss._compute
-mse_loss = MSELoss._compute
-
-
-def build_cross_entropy_loss(compile_config: CompileConfig, **kwargs):
-    """Build a CrossEntropyLoss instance."""
-    del kwargs
-    return CrossEntropyLoss(compile_config)
-
-
-def build_mse_loss(compile_config: CompileConfig, **kwargs):
-    """Build an MSELoss instance."""
-    del kwargs
-    return MSELoss(compile_config)
+        return self._fn(pred, labels)
 
 
 class GradAccumulator:
@@ -172,7 +143,7 @@ class GradAccumulator:
         return self._buffer
 
 
-class ChunkedCELoss:
+class ChunkedCELoss(Configurable):
     """Chunked cross-entropy loss that splits the sequence dimension to reduce peak memory.
 
     Instead of materializing the full [B, L, V] logits tensor at once, this splits
@@ -192,10 +163,8 @@ class ChunkedCELoss:
     FSDP2 composability:
         The lm_head's FSDP reshard-after-forward and reshard-after-backward are
         temporarily disabled during the chunked loop so that the weight stays
-        unsharded across all chunks (avoiding repeated all-gathers). Gradient
-        sync is also disabled so that reduce-scatter is deferred until the
-        decoder backward pass, where the lm_head's FSDP group participates
-        in the normal backward hook chain.
+        unsharded across all chunks (avoiding repeated all-gathers). Reduce-scatter
+        fires per-chunk, and FSDP2 accumulates the sharded gradients correctly.
 
     TP with Loss Parallel:
         Loss parallel still works within each chunk since the ``loss_parallel()``
@@ -204,61 +173,47 @@ class ChunkedCELoss:
     CP: Further chunks the local sequence dimension. Works out of the box.
 
     Compile: ce_loss can be compiled independently; lm_head is not compiled.
-
-    Args:
-        num_chunks: Number of chunks to split the sequence into.
-        compile_config: Optional compile config for the CE loss function.
-        pp_enabled: If True, returns a differentiable loss for PP schedule
-            backward. If False, does full backward internally.
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        num_chunks: int = 8
+        """Number of chunks to split the sequence into."""
 
     def __init__(
         self,
-        num_chunks: int,
+        config: Config,
+        *,
         compile_config: CompileConfig | None = None,
-        pp_enabled: bool = False,
     ):
-        self.num_chunks = num_chunks
-        self.loss_fn = CrossEntropyLoss(compile_config)
-        self.pp_enabled = pp_enabled
+        self.num_chunks = config.num_chunks
+        self.loss_fn = CrossEntropyLoss(
+            CrossEntropyLoss.Config(), compile_config=compile_config
+        )
         self.lm_head: nn.Module | None = None
-        self._scale: torch.Tensor | None = None
 
-    def init_lm_head(self, model: nn.Module) -> None:
-        """Set the lm_head reference from the model. Must be called before
-        the first __call__, after the model is constructed."""
-        from torchtitan.models.common.decoder import Decoder
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute chunked cross-entropy loss.
 
-        assert isinstance(
-            model, Decoder
-        ), f"ChunkedCELoss requires a Decoder model, got {type(model).__name__}"
-        assert (
-            model.output is not None
-        ), "ChunkedCELoss requires the model to have an output (lm_head) layer"
-        self.lm_head = model.output
+        ``pred`` should be hidden states from model forward with
+        ``skip_lm_head=True``.
 
-    def set_scale(self, scale: torch.Tensor) -> None:
-        """Set a scaling factor applied to each chunk's loss before backward."""
-        self._scale = scale
-
-    def _chunked_lm_head_backward(
-        self, hidden_states: torch.Tensor, labels: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run chunked lm_head + CE loss + per-chunk backward.
-
-        Returns:
-            total_loss: The unscaled loss sum (detached).
-            accumulated_grad: The accumulated gradient for hidden_states,
-                ready to be used for decoder backward.
+        Returns a differentiable loss. When ``.backward()`` is called on it
+        (either by the trainer or the PP schedule), it triggers backward
+        through the decoder via a custom autograd Function.
         """
         from torch.distributed._composable.fsdp import FSDPModule
         from torch.distributed.tensor import DTensor, Replicate
 
-        assert self._scale is not None, "Call set_scale() before __call__"
-        scale = self._scale
+        hidden_states = pred
         num_chunks = self.num_chunks
         lm_head = self.lm_head
-        assert lm_head is not None, "Call init_lm_head(model) before __call__"
+        assert lm_head is not None, "Set lm_head before calling ChunkedCELoss"
         is_fsdp = isinstance(lm_head, FSDPModule)
 
         # If SP is enabled, hidden states are Shard(1) on the TP mesh.
@@ -311,13 +266,13 @@ class ChunkedCELoss:
             total_loss = total_loss + chunk_loss.detach()
 
             # Scale loss before backward so gradients are properly normalized
-            (chunk_loss * scale).backward()
+            scaled_chunk_loss = chunk_loss / global_valid_tokens
+            scaled_chunk_loss.backward()
 
             # Collect this chunk's gradient and free it before the next
             # chunk to keep only one chunk's activations in memory.
             grad_accumulator.add(h_chunk.grad)
             h_chunk.grad = None
-            del scaled_chunk_loss, chunk_loss, logits
 
         if is_fsdp:
             lm_head.set_reshard_after_forward(True)
@@ -334,34 +289,41 @@ class ChunkedCELoss:
                 placements=hidden_states.placements,
             )
 
-        return total_loss, accumulated_grad
+        # Return a differentiable loss via _DeferredBackward. When
+        # .backward() is called (by the trainer or PP schedule), autograd
+        # calls _DeferredBackward.backward which returns accumulated_grad
+        # as the gradient for hidden_states, propagating through the decoder.
+        loss = total_loss / global_valid_tokens
+        return _DeferredBackward.apply(hidden_states, accumulated_grad, loss)
 
-    def __call__(self, pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute chunked cross-entropy loss.
 
-        Same signature as standard loss functions: ``loss_fn(pred, labels)``.
-        ``pred`` should be hidden states from model forward with
-        ``skip_lm_head=True``. Call ``set_global_valid_tokens()`` before this.
+class _DeferredBackward(torch.autograd.Function):
+    """Bridges chunked lm_head backward with decoder backward via autograd.
 
-        In non-PP mode: does full backward (lm_head + decoder) internally,
-        returns a detached loss for logging.
+    Forward takes hidden_states (connected to decoder graph), the accumulated
+    gradient from chunked lm_head backward, and the loss value. Returns the
+    loss value as a differentiable tensor.
 
-        In PP mode: does chunked lm_head backward only, returns a
-        differentiable loss connected to ``pred`` so the PP schedule can
-        backward through the decoder layers.
-        """
-        hidden_states = pred
-        total_loss, accumulated_grad = self._chunked_lm_head_backward(
-            hidden_states, labels
-        )
+    Backward returns accumulated_grad as the gradient for hidden_states.
+    Autograd then propagates this through the decoder layers automatically —
+    no explicit hidden_states.backward() needed.
+    """
 
-        if self.pp_enabled:
-            # PP mode: return a differentiable loss so the PP schedule can
-            # backward through the decoder. (h * grad).sum() creates a scalar
-            # connected to hidden_states' autograd graph.
-            decoder_loss = (hidden_states * accumulated_grad).sum()
-            return decoder_loss
-        else:
-            # Non-PP mode: backward through the decoder ourselves.
-            hidden_states.backward(accumulated_grad)
-            return total_loss * self._scale
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        accumulated_grad: torch.Tensor,
+        loss: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(accumulated_grad)
+        # Return a tensor with the correct loss value. We clone to avoid
+        # in-place issues, and the grad_fn comes from this Function.
+        return loss.detach().clone()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        (accumulated_grad,) = ctx.saved_tensors
+        # Return accumulated_grad as the gradient for hidden_states.
+        # Autograd propagates it through the decoder model's existing graph.
+        return accumulated_grad, None, None

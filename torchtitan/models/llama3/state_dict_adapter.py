@@ -38,7 +38,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
             "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             "model.norm.weight": "norm.weight",
-            "lm_head.weight": "output.weight",
+            "lm_head.weight": "lm_head.weight",
         }
 
     # HuggingFace permutation function (exact copy from their conversion script)
@@ -98,7 +98,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
                     continue
                 new_key = new_key.format(layer_num)
             else:
-                if self.model_config.enable_weight_tying and key == "output.weight":
+                if self.model_config.enable_weight_tying and key == "lm_head.weight":
                     continue
                 new_key = to_hf_map[key]
 

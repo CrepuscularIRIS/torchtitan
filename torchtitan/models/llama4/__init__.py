@@ -9,7 +9,7 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.loss import build_cross_entropy_loss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
@@ -184,7 +184,7 @@ def _debugmodel() -> Llama4Model.Config:
             param_init=_EMBEDDING_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=2048,
             param_init=_output_linear_init(dim),
@@ -234,7 +234,7 @@ def _17bx16e() -> Llama4Model.Config:
             param_init=_EMBEDDING_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -286,7 +286,7 @@ def _17bx128e() -> Llama4Model.Config:
             param_init=_EMBEDDING_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -329,7 +329,7 @@ def model_registry(flavor: str) -> ModelSpec:
         model=config,
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llm,
-        build_loss_fn=build_cross_entropy_loss,
+        loss=CrossEntropyLoss.Config(),
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=Llama4StateDictAdapter,
     )

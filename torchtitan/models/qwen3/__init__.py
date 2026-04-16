@@ -11,7 +11,7 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.loss import build_cross_entropy_loss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import Embedding, Linear, RoPE, TransformerBlock
 from torchtitan.models.common.attention import (
@@ -191,7 +191,7 @@ def _debugmodel() -> Qwen3Model.Config:
             embedding_dim=dim,
             param_init=_EMBEDDING_SKIP_INIT,
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -281,7 +281,7 @@ def _0_6b() -> Qwen3Model.Config:
             embedding_dim=dim,
             param_init=_EMBEDDING_SKIP_INIT,
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -331,7 +331,7 @@ def _1_7b() -> Qwen3Model.Config:
             embedding_dim=dim,
             param_init=_EMBEDDING_SKIP_INIT,
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -381,7 +381,7 @@ def _4b() -> Qwen3Model.Config:
             embedding_dim=dim,
             param_init=_EMBEDDING_SKIP_INIT,
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -415,7 +415,7 @@ def _8b() -> Qwen3Model.Config:
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -462,7 +462,7 @@ def _14b() -> Qwen3Model.Config:
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -496,7 +496,7 @@ def _32b() -> Qwen3Model.Config:
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -533,7 +533,7 @@ def _debugmodel_moe() -> Qwen3Model.Config:
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -569,7 +569,7 @@ def _30b_a3b() -> Qwen3Model.Config:
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -605,7 +605,7 @@ def _235b_a22b() -> Qwen3Model.Config:
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -657,7 +657,7 @@ def model_registry(flavor: str) -> ModelSpec:
         model=config,
         parallelize_fn=parallelize_qwen3,
         pipelining_fn=pipeline_llm,
-        build_loss_fn=build_cross_entropy_loss,
+        loss=CrossEntropyLoss.Config(),
         post_optimizer_build_fn=None,
         state_dict_adapter=Qwen3StateDictAdapter,
     )

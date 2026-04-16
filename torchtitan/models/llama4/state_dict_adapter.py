@@ -27,7 +27,7 @@ class Llama4StateDictAdapter(StateDictAdapter):
         self.from_hf_map = {
             "language_model.model.embed_tokens.weight": "tok_embeddings.weight",
             "language_model.model.norm.weight": "norm.weight",
-            "language_model.lm_head.weight": "output.weight",
+            "language_model.lm_head.weight": "lm_head.weight",
             "language_model.model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
             "language_model.model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
             "language_model.model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
