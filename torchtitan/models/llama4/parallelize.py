@@ -221,7 +221,7 @@ def apply_non_moe_tp(
         {
             "tok_embeddings": embed_plan,
             "norm": SequenceParallel() if enable_sp else NoParallel(),
-            "output": ColwiseParallel(
+            "lm_head": ColwiseParallel(
                 input_layouts=sp_layout,
                 output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
                 use_local_output=not enable_loss_parallel,
