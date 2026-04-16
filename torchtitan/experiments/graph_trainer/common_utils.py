@@ -18,6 +18,29 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 _AC_REGION_ID = "ac_region_id"
+_MODULE_FQN = "module_fqn"
+
+
+def annotate_module_fqns(model: nn.Module) -> None:
+    """Annotate all modules' forward with their fully-qualified names.
+
+    Every named submodule (excluding the root) gets its forward method wrapped
+    with ``annotate_fn`` so that FX nodes carry ``module_fqn`` in
+    ``node.meta["custom"]``.
+
+    Call once after model construction, before tracing/compilation.
+
+    .. note::
+
+        When traced via ``trace_train_step``, multiple instances of the
+        **same class with no parameters** may all receive the first instance's
+        FQN.  This is because ``_reparametrize_module`` with an empty state
+        dict causes ``make_fx`` to collapse the ``annotate_fn`` contexts for
+        parameterless same-class instances.
+    """
+    for fqn, submodule in model.named_modules():
+        if fqn:  # skip root module
+            submodule.forward = annotate_fn({_MODULE_FQN: fqn})(submodule.forward)
 
 
 def annotate_ac_regions(model: nn.Module) -> None:

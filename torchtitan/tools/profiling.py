@@ -8,9 +8,10 @@ import contextlib
 import os
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+from torchtitan.config.function import Function
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module
 
@@ -71,6 +72,13 @@ class ProfilingConfig:
     save_memory_snapshot_folder: str = "memory_snapshot"
     """Memory snapshot files location"""
 
+    trace_post_processors: list[Function.Config] = field(default_factory=list)
+    """Callbacks invoked with the trace path after each export.
+
+    Experiments can attach post-processors. Each entry is a
+    ``Function.Config`` wrapping ``fn(trace_path: str) -> None``.
+    """
+
 
 @contextlib.contextmanager
 def maybe_enable_profiling(
@@ -102,6 +110,9 @@ def maybe_enable_profiling(
         }
 
         rank = torch.distributed.get_rank()
+        post_processors = [
+            cfg.build() for cfg in profiling_config.trace_post_processors
+        ]
 
         def trace_handler(prof):
             curr_trace_dir_name = "iteration_" + str(prof.step_num)
@@ -114,6 +125,10 @@ def maybe_enable_profiling(
 
             output_file = os.path.join(curr_trace_dir, f"rank{rank}_trace.json")
             prof.export_chrome_trace(output_file)
+
+            for post_processor in post_processors:
+                post_processor(output_file)
+
             logger.info(
                 f"Finished dumping profiler traces in {time.monotonic() - begin:.2f} seconds"
             )

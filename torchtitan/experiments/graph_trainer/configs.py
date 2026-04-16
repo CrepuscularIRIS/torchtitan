@@ -66,6 +66,7 @@ def to_graph_trainer_config(
     from the graph_trainer model_registry. The compile field is removed and
     left as the GraphTrainerConfig default; callers should explicitly set it.
     """
+    from .cudagraph import cudagraph_annotate_trace_post_processor
     from .trainer import GraphTrainer
 
     d = {f.name: getattr(base_config, f.name) for f in fields(base_config)}
@@ -77,5 +78,14 @@ def to_graph_trainer_config(
     ac = d.get("activation_checkpoint")
     if ac is not None and ac.mode != "none":
         d["activation_checkpoint"] = ActivationCheckpointConfig(mode="selective")
+
+    # Merge CUDA graph kernel annotations into profiler traces when profiling
+    # is active.  No-op otherwise (and no-op when requirements aren't met).
+    # It's also a no-op if there is CUDA graph is not enabled.
+    profiling = d.get("profiling")
+    if profiling is not None:
+        profiling.trace_post_processors.append(
+            cudagraph_annotate_trace_post_processor()
+        )
 
     return GraphTrainer.Config(**d)

@@ -112,11 +112,22 @@ def construct_default_graph_passes(
     from torchtitan.experiments.graph_trainer.cudagraph import is_cudagraph_compatible
 
     passes: list[Callable] = []
+    cudagraph_compatible = is_cudagraph_compatible(traced_result.gm)
+
     if not precompiled:
-        passes.extend(compile_time_passes(traced_result))
+        pre_passes = compile_time_passes(traced_result)
+        # insert_kernel_annotations must run before custom_codegen_pass
+        # (which saves code to disk and replaces forward with a loaded
+        # module) so that the inserted mark_kernels enter/exit calls end
+        # up in the saved graph.
+        if cudagraph_compatible:
+            pre_passes = _insert_before_custom_codegen(
+                pre_passes, insert_kernel_annotations_pass
+            )
+        passes.extend(pre_passes)
 
     # cudagraph should be the last pass.
-    if is_cudagraph_compatible(traced_result.gm):
+    if cudagraph_compatible:
         static_input_indices = list(range(traced_result.num_static_inputs))
         passes.append(
             functools.partial(
@@ -127,6 +138,26 @@ def construct_default_graph_passes(
             )
         )
     return passes
+
+
+def _insert_before_custom_codegen(
+    passes: list[Callable], new_pass: Callable
+) -> list[Callable]:
+    """Return a new pass list with ``new_pass`` inserted before custom_codegen_pass.
+
+    If custom_codegen_pass is not present, appends ``new_pass`` at the end.
+    """
+    result: list[Callable] = []
+    inserted = False
+    for p in passes:
+        name = getattr(p, "__name__", "")
+        if not inserted and name == "custom_codegen_pass":
+            result.append(new_pass)
+            inserted = True
+        result.append(p)
+    if not inserted:
+        result.append(new_pass)
+    return result
 
 
 def apply_graph_passes(
@@ -287,6 +318,96 @@ def regional_inductor_pass(
     # regional_inductor may switch to boxed calling convention; reset to
     # default so the graph can be called with positional args as usual.
     gm.graph.set_codegen(torch.fx.graph.CodeGen())
+    gm.recompile()
+    return gm
+
+
+def insert_kernel_annotations_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Insert mark_kernels() calls at module boundaries in the FX graph.
+
+    Reads ``node.meta["custom"]["module_fqn"]`` (set via
+    ``annotate_module_fqns``) and inserts enter/exit calls so that
+    CUDA graph capture records the annotations.
+
+    Requires ``cuda-python`` package and CUDA toolkit/driver >= 13.1
+    (or cuda-compat >= 13.1).  Returns the graph unchanged when unavailable.
+
+    Also enables annotation capture on :class:`CUDAGraphWrapper` so that
+    ``enable_annotations=True`` is passed to ``torch.cuda.graph()``.
+
+    Alternative approaches:
+
+    1. **fx.Interpreter**: During cudagraph capture, run the graph via an
+       ``fx.Interpreter`` subclass that reads ``module_fqn`` metadata and
+       calls ``mark_kernels`` enter/exit around each node — avoids mutating
+       the graph.
+    2. **Custom CodeGen**: Use a custom ``torch.fx.graph.CodeGen`` to emit
+       enter/exit lines (or ``with`` blocks) directly in the generated
+       Python code.
+
+    The current graph-pass approach is the least invasive.
+    """
+    from torch.cuda._graph_annotations import _is_tools_id_unavailable
+
+    from torchtitan.experiments.graph_trainer.common_utils import _MODULE_FQN
+    from torchtitan.experiments.graph_trainer.cudagraph import (
+        enable_cudagraph_annotations,
+    )
+
+    def _enter(annotation: dict) -> object:
+        from torch.cuda._graph_annotations import mark_kernels
+
+        ctx = mark_kernels(annotation)
+        ctx.__enter__()
+        return ctx
+
+    def _exit(ctx: object) -> None:
+        ctx.__exit__(None, None, None)  # type: ignore[union-attr]
+
+    if _is_tools_id_unavailable():
+        return gm
+
+    enable_cudagraph_annotations()
+
+    graph = gm.graph
+    current_fqn: str | None = None
+    current_ctx_node = None
+
+    for node in list(graph.nodes):
+        fqn = (node.meta.get("custom") or {}).get(_MODULE_FQN)
+
+        if fqn != current_fqn:
+            # Close previous scope
+            if current_ctx_node is not None:
+                with graph.inserting_before(node):
+                    exit_node = graph.call_function(_exit, (current_ctx_node,))
+                    exit_node.meta["custom"] = {}
+                current_ctx_node = None
+
+            # Open new scope
+            if fqn is not None:
+                with graph.inserting_before(node):
+                    enter_node = graph.call_function(
+                        _enter,
+                        ({_MODULE_FQN: fqn},),
+                    )
+                    enter_node.meta["custom"] = {}
+                current_ctx_node = enter_node
+
+            current_fqn = fqn
+
+    # Close any trailing scope (before output/return)
+    if current_ctx_node is not None:
+        output_nodes = [n for n in graph.nodes if n.op == "output"]
+        if output_nodes:
+            with graph.inserting_before(output_nodes[0]):
+                exit_node = graph.call_function(_exit, (current_ctx_node,))
+                exit_node.meta["custom"] = {}
+
+    graph.lint()
     gm.recompile()
     return gm
 

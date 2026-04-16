@@ -19,6 +19,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_ac_regions,
+    annotate_module_fqns,
     apply_graph_ac,
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
@@ -46,6 +47,9 @@ def annotate_qwen3(model: GraphTrainerQwen3Model) -> None:
     - AC region annotation: Tags each transformer block's forward with a unique
       ac_region_id so that apply_sac_pass can assign per-block ac_graph_id
       boundaries for the min-cut partitioner.
+    - Module FQN annotation: Tags each submodule's forward with its
+      fully-qualified name so that insert_kernel_annotations_pass can label
+      CUDA graph kernels with their originating module.
     """
     from torchtitan.models.common.attention import FlexAttention
 
@@ -67,6 +71,7 @@ def annotate_qwen3(model: GraphTrainerQwen3Model) -> None:
     )
 
     annotate_ac_regions(model)
+    annotate_module_fqns(model)
 
 
 def parallelize_qwen3(
