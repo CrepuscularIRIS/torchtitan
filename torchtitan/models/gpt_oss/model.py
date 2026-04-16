@@ -25,6 +25,7 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import apply_moe_load_balance_config
 from torchtitan.models.common.rope import apply_rotary_emb_cos_sin
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
@@ -217,6 +218,11 @@ class GptOssModel(Decoder):
                             "Failed to use grouped mm, which is only supported on SM90 or later",
                         )
                         layer_cfg.moe.experts.use_grouped_mm = False
+                    apply_moe_load_balance_config(
+                        layer_cfg.moe,
+                        training_config=training,
+                        pp_enabled=parallelism.pipeline_parallel_degree > 1,
+                    )
 
             tp = parallelism.tensor_parallel_degree
             if tp > 1:

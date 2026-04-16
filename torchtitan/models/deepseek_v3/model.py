@@ -19,6 +19,7 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import apply_moe_load_balance_config
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.models.common.rope import apply_rotary_emb_single_complex
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
@@ -222,6 +223,11 @@ class DeepSeekV3Model(Decoder):
                         layer_cfg.moe.experts.use_grouped_mm = False
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
+                    )
+                    apply_moe_load_balance_config(
+                        layer_cfg.moe,
+                        training_config=training,
+                        pp_enabled=parallelism.pipeline_parallel_degree > 1,
                     )
                     if parallelism.expert_parallel_comm_backend in (
                         "deepep",

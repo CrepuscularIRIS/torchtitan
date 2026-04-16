@@ -118,6 +118,74 @@ class GroupedExperts(Module):
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
 
 
+class _AuxLossBackward(torch.autograd.Function):
+    """Injects auxiliary load-balance loss gradients at the router scores level.
+
+    Identity in forward (returns ``scores`` unchanged). In backward, recomputes
+    the aux loss from saved (detached) inputs, derives ``d(aux_loss)/d(scores)``
+    via ``torch.autograd.grad``, and adds it to the incoming gradient. This
+    avoids ``retain_graph=True`` (compatible with activation checkpointing) and
+    keeps the model forward return type unchanged (PP-safe).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+        num_experts: int,
+        bs: int,
+        slen: int,
+        top_k: int,
+        aux_loss_weight: float,
+        aux_loss_type: str,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(scores, selected_experts_indices)
+        ctx.num_experts = num_experts  # pyrefly: ignore [missing-attribute]
+        ctx.bs = bs  # pyrefly: ignore [missing-attribute]
+        ctx.slen = slen  # pyrefly: ignore [missing-attribute]
+        ctx.top_k = top_k  # pyrefly: ignore [missing-attribute]
+        ctx.aux_loss_weight = aux_loss_weight  # pyrefly: ignore [missing-attribute]
+        ctx.aux_loss_type = aux_loss_type  # pyrefly: ignore [missing-attribute]
+        return scores
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
+        scores, selected_experts_indices = ctx.saved_tensors
+        # pyrefly: ignore [missing-attribute]
+        with torch.enable_grad():
+            scores_detached = scores.detach().requires_grad_(True)
+            if (
+                ctx.aux_loss_type == "sequence_wise"
+            ):  # pyrefly: ignore [missing-attribute]
+                aux_loss = MoE._sequence_wise_aux_loss(
+                    scores_detached,
+                    selected_experts_indices,
+                    ctx.bs,  # pyrefly: ignore [missing-attribute]
+                    ctx.slen,  # pyrefly: ignore [missing-attribute]
+                    ctx.top_k,  # pyrefly: ignore [missing-attribute]
+                    ctx.aux_loss_weight,  # pyrefly: ignore [missing-attribute]
+                )
+            else:
+                num_tokens_per_expert = torch.histc(
+                    selected_experts_indices.view(-1).float(),
+                    bins=ctx.num_experts,  # pyrefly: ignore [missing-attribute]
+                    min=0,
+                    max=ctx.num_experts,  # pyrefly: ignore [missing-attribute]
+                )
+                aux_loss = MoE._batch_wise_aux_loss(
+                    scores_detached,
+                    num_tokens_per_expert,
+                    ctx.top_k,  # pyrefly: ignore [missing-attribute]
+                    ctx.aux_loss_weight,  # pyrefly: ignore [missing-attribute]
+                )
+            (aux_grad,) = torch.autograd.grad(aux_loss, scores_detached)
+        return grad_scores + aux_grad, None, None, None, None, None, None, None
+
+
 class TokenChoiceTopKRouter(Module):
     """This class implements token-choice routing. In token-choice top-K routing, each token is
         routed to top K experts based on the router scores.
@@ -150,6 +218,7 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self._debug_force_load_balance = config._debug_force_load_balance
+        self.aux_loss_type: str = "sequence_wise"  # set by MoE.__init__
 
     def _debug_force_load_balance_routing(
         self, scores: torch.Tensor
@@ -211,13 +280,22 @@ class TokenChoiceTopKRouter(Module):
         return scores_for_choice
 
     def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        expert_bias: torch.Tensor | None = None,
+        *,
+        aux_loss_weight: float = 0.0,
+        bs: int = 0,
+        slen: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
             expert_bias (torch.Tensor | None, optional): Optional bias tensor for experts with shape ``(num_experts,)``.
                 Used for load balancing. Defaults to None.
+            aux_loss_weight (float): Scaled aux loss weight for this call. 0 disables injection.
+            bs (int): Batch size (needed for aux loss). Ignored when aux loss is disabled.
+            slen (int): Sequence length (needed for aux loss). Ignored when aux loss is disabled.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -249,6 +327,23 @@ class TokenChoiceTopKRouter(Module):
         _, selected_experts_indices = torch.topk(
             scores_for_choice, k=self.top_k, dim=-1, sorted=False
         )
+
+        # Inject aux loss gradient into scores before deriving top_scores.
+        # _AuxLossBackward is identity in forward; in backward it adds
+        # d(aux_loss)/d(scores) to the gradient flowing through scores.
+        # Because top_scores is derived from scores below, the aux gradient
+        # naturally flows through to gate.weight via autograd.
+        if self.training and aux_loss_weight > 0:
+            scores = _AuxLossBackward.apply(
+                scores,
+                selected_experts_indices,
+                self.num_experts,
+                bs,
+                slen,
+                self.top_k,
+                aux_loss_weight,
+                self.aux_loss_type,
+            )
 
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
@@ -343,6 +438,15 @@ class MoE(Module):
         score_before_experts: bool = True
         load_balance_coeff: float | None = 1e-3
         shared_experts: FeedForward.Config | None = None
+        aux_loss_weight: float = 0.0
+        """Weight for the auxiliary load-balance loss. 0 disables it."""
+        aux_loss_type: Literal["sequence_wise", "batch_wise"] = "sequence_wise"
+        """Type of auxiliary load-balance loss."""
+        aux_loss_local_batch_size: int | None = None
+        """Total local batch size (before microbatching). Used to normalize aux
+        loss gradients across pipeline-parallel microbatches so they match the
+        non-PP case. Set automatically by the trainer; None means use the
+        microbatch bs (no normalization)."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -357,6 +461,12 @@ class MoE(Module):
             config.shared_experts.build() if config.shared_experts is not None else None
         )
         self.score_before_experts = config.score_before_experts
+        self.aux_loss_weight = config.aux_loss_weight
+        self.aux_loss_local_batch_size = config.aux_loss_local_batch_size
+        self.top_k = config.router.top_k
+
+        # Set aux loss type on the router at init time (fixed for model lifetime).
+        self.router.aux_loss_type = config.aux_loss_type
 
         # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
         # NOTE: tokens_per_expert is accumulated in the model forward pass.
@@ -413,13 +523,20 @@ class MoE(Module):
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
+        # Compute the per-call aux loss weight, scaled so accumulated gradients
+        # across PP microbatches match the single-batch case.
+        local_bs = self.aux_loss_local_batch_size or bs
+        scaled_aux_weight = self.aux_loss_weight * bs / local_bs
+
         # top_scores and selected_experts_indices shape (bs*slen, top_k)
         # num_tokens_per_expert shape (num_experts,)
-        (
-            top_scores,
-            selected_experts_indices,
-            num_tokens_per_expert,
-        ) = self.router(x, self.expert_bias)
+        (top_scores, selected_experts_indices, num_tokens_per_expert,) = self.router(
+            x,
+            self.expert_bias,
+            aux_loss_weight=scaled_aux_weight,
+            bs=bs,
+            slen=slen,
+        )
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -489,3 +606,99 @@ class MoE(Module):
                 self.expert_bias = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
+
+    @staticmethod
+    def _sequence_wise_aux_loss(
+        scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+        bs: int,
+        slen: int,
+        top_k: int,
+        aux_loss_weight: float,
+    ) -> torch.Tensor:
+        """Sequence-wise auxiliary load-balance loss (DeepSeek-V3 Eqs 17-20).
+
+        Computes per-sequence load-balance loss from router scores and expert
+        assignments, then averages across sequences.
+
+        Args:
+            scores: Router scores after sigmoid/softmax, shape ``(bs*slen, num_experts)``.
+            selected_experts_indices: Top-k expert indices, shape ``(bs*slen, top_k)``.
+            bs: Batch size.
+            slen: Sequence length.
+            top_k: Number of experts per token.
+            aux_loss_weight: Scalar weight for the loss.
+        """
+        num_experts = scores.size(-1)
+        # (B, S, N) — per-sequence view
+        scores_per_seq = scores.view(bs, slen, num_experts)
+
+        # Eq 19: normalize scores so they sum to 1 per token
+        denom = scores_per_seq.sum(dim=-1, keepdim=True) + 1e-20
+        probs_per_seq = scores_per_seq / denom
+
+        # Eq 20: P_i = mean probability per expert per sequence — (B, N)
+        p_i = probs_per_seq.mean(dim=1)
+
+        # Eq 18: f_i = expert selection frequency per sequence — (B, N)
+        indices_per_seq = selected_experts_indices.view(bs, -1)  # (B, S*K)
+        offset = (
+            torch.arange(bs, device=indices_per_seq.device).unsqueeze(1) * num_experts
+        )
+        flat_indices = (indices_per_seq + offset).reshape(-1)
+        counts = torch.bincount(flat_indices.long(), minlength=bs * num_experts)
+        counts = counts.reshape(bs, num_experts).to(dtype=scores.dtype)
+        f_i = counts * (num_experts / (top_k * slen))
+
+        # Eq 17: per-sequence balance loss, averaged over sequences
+        return (f_i * p_i).sum(dim=1).mean() * aux_loss_weight
+
+    @staticmethod
+    def _batch_wise_aux_loss(
+        scores: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        top_k: int,
+        aux_loss_weight: float,
+    ) -> torch.Tensor:
+        """Batch-wise auxiliary load-balance loss.
+
+        Args:
+            scores: Router scores after sigmoid/softmax, shape ``(bs*slen, num_experts)``.
+            num_tokens_per_expert: Token counts per expert, shape ``(num_experts,)``.
+            top_k: Number of experts per token.
+            aux_loss_weight: Scalar weight for the loss.
+        """
+        num_experts = scores.size(-1)
+        total_tokens = scores.size(0)
+        p_i = scores.mean(dim=0)
+        f_i = num_tokens_per_expert.to(scores.dtype) * (
+            num_experts / (top_k * total_tokens)
+        )
+        return (f_i * p_i).sum() * aux_loss_weight
+
+
+def apply_moe_load_balance_config(
+    moe_cfg: MoE.Config,
+    *,
+    training_config,
+    pp_enabled: bool = False,
+) -> None:
+    """Apply CLI training config overrides to a MoE.Config.
+
+    Called from each model's ``update_from_config`` for every MoE layer.
+    CLI values override model-config defaults when explicitly set (non-zero
+    for weights, non-None for coefficients).
+    """
+    if training_config.moe_aux_loss_weight > 0:
+        moe_cfg.aux_loss_weight = training_config.moe_aux_loss_weight
+        moe_cfg.aux_loss_type = training_config.moe_aux_loss_type
+    if training_config.moe_load_balance_coeff is not None:
+        moe_cfg.load_balance_coeff = training_config.moe_load_balance_coeff
+    if moe_cfg.aux_loss_weight > 0:
+        if moe_cfg.aux_loss_type == "batch_wise" and pp_enabled:
+            raise ValueError(
+                "batch_wise MoE aux loss is incompatible with pipeline "
+                "parallelism because per-microbatch token-to-expert counts "
+                "do not reflect the full batch. Use sequence_wise instead."
+            )
+        moe_cfg.aux_loss_local_batch_size = training_config.local_batch_size

@@ -88,6 +88,8 @@ def make_moe_config(
     shared_experts: FeedForward.Config | None = None,
     score_before_experts: bool = True,
     load_balance_coeff: float | None = 1e-3,
+    aux_loss_weight: float = 0.0,
+    aux_loss_type: Literal["sequence_wise", "batch_wise"] = "sequence_wise",
 ) -> MoE.Config:
     """Build a fully-specified MoE.Config."""
     return MoE.Config(
@@ -97,6 +99,8 @@ def make_moe_config(
         router=router,
         experts=experts,
         shared_experts=shared_experts,
+        aux_loss_weight=aux_loss_weight,
+        aux_loss_type=aux_loss_type,
     )
 
 

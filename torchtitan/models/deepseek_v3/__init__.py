@@ -175,6 +175,8 @@ def _build_dsv3_layers(
     router_route_scale: float = 1.0,
     router_route_norm: bool = False,
     score_before_experts: bool = False,
+    aux_loss_weight: float = 0.0,
+    aux_loss_type: Literal["sequence_wise", "batch_wise"] = "sequence_wise",
     inner_attention=None,
     mask_type: str = "causal",
 ) -> list[TransformerBlock.Config]:
@@ -238,6 +240,8 @@ def _build_dsv3_layers(
                     w1_param_init=_LINEAR_INIT,
                     w2w3_param_init=_depth_init(layer_id),
                 ),
+                aux_loss_weight=aux_loss_weight,
+                aux_loss_type=aux_loss_type,
             )
 
         layers.append(
@@ -284,6 +288,7 @@ def _debugmodel() -> DeepSeekV3Model.Config:
         router_top_k=3,
         router_score_func="softmax",
         score_before_experts=False,
+        aux_loss_weight=0.01,
     )
     return DeepSeekV3Model.Config(
         vocab_size=vocab_size,

@@ -20,6 +20,7 @@ from torchtitan.models.common.attention import (
     get_fixed_block_mask_mod,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.moe import apply_moe_load_balance_config
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
@@ -148,6 +149,11 @@ class Llama4Model(Decoder):
                         layer_cfg.moe.experts.use_grouped_mm = False
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
+                    )
+                    apply_moe_load_balance_config(
+                        layer_cfg.moe,
+                        training_config=training,
+                        pp_enabled=parallelism.pipeline_parallel_degree > 1,
                     )
                     if parallelism.expert_parallel_comm_backend == "deepep":
                         from torchtitan.models.common.moe_deepep import DeepEPMoE

@@ -79,6 +79,16 @@ class TrainingConfig:
     many temporary files.
     """
 
+    moe_aux_loss_weight: float = 0.0
+    """Weight for the MoE auxiliary load-balance loss. 0 disables it."""
+
+    moe_aux_loss_type: Literal["sequence_wise", "batch_wise"] = "sequence_wise"
+    """Type of MoE auxiliary load-balance loss."""
+
+    moe_load_balance_coeff: float | None = None
+    """Coefficient for aux-loss-free bias-based MoE load balancing.
+    Overrides the model config default when set. None means use model default."""
+
 
 @dataclass(kw_only=True, slots=True)
 class ParallelismConfig:

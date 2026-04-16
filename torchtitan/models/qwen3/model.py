@@ -18,6 +18,7 @@ from torchtitan.models.common.attention import (
     VarlenAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.moe import apply_moe_load_balance_config
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
@@ -107,6 +108,11 @@ class Qwen3Model(Decoder):
                 if layer_cfg.moe is not None:
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
+                    )
+                    apply_moe_load_balance_config(
+                        layer_cfg.moe,
+                        training_config=training,
+                        pp_enabled=parallelism.pipeline_parallel_degree > 1,
                     )
 
             if parallelism.context_parallel_degree > 1 and isinstance(
