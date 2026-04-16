@@ -42,7 +42,7 @@ from torchtitan.experiments.rl.actors.generator import VLLMGenerator
 from torchtitan.experiments.rl.actors.grader import Grader
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.sum_digits import extract_answer, SumDigitsTask
-from torchtitan.experiments.rl.types import Episode, TrainBatch
+from torchtitan.experiments.rl.types import Completion, Episode, TrainBatch
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -146,20 +146,22 @@ class Provisioner:
         return _bootstrap
 
 
-def _log_samples(episodes: list[Episode]) -> None:
-    """Log the first completion per group for debugging."""
-    seen_groups: set[str] = set()
+def _log_samples(episodes: list[Episode], expected_answers: list[str]) -> None:
+    """Log the first completion per prompt for debugging.
+
+    ``expected_answers`` is one entry per prompt, indexed by ``prompt_idx``.
+    """
+    seen_prompts: set[int] = set()
     for ep in episodes:
-        if ep.group_id in seen_groups:
+        if ep.prompt_idx in seen_prompts:
             continue
-        seen_groups.add(ep.group_id)
+        seen_prompts.add(ep.prompt_idx)
         extracted = extract_answer(ep.text)
-        is_correct = (
-            extracted == int(ep.expected_answer) if ep.expected_answer else None
-        )
+        expected = expected_answers[ep.prompt_idx]
+        is_correct = extracted == int(expected) if expected else None
         mark = "+" if is_correct else "-"
         logger.info(
-            f"  [{mark}] expected={ep.expected_answer} extracted={extracted} "
+            f"  [{mark}] expected={expected} extracted={extracted} "
             f"reward={ep.reward:+.1f}"
         )
         logger.info(f"       A: {ep.text[:300].replace(chr(10), ' ').strip()}")
@@ -292,7 +294,7 @@ class RLTrainer(Configurable):
                 [ep.advantage for ep in episodes],
                 dtype=torch.float32,
             ),
-            token_logprobs=[ep.token_log_probs for ep in episodes],
+            token_logprobs=[ep.token_logprobs for ep in episodes],
         )
 
     async def setup(
@@ -448,43 +450,58 @@ class RLTrainer(Configurable):
     async def evaluate(self, num_samples: int = 20) -> dict:
         """Run evaluation on held-out prompts.
 
-        Generates on eval prompts, scores them, and reports accuracy.
+        Uses the generator's default (training) sampling config and
+        scores the first sample per prompt -- preserves the
+        pre-refactor eval signal.
+
+        TODO: report both greedy (temperature=0, n=1) and pass@k
+        (training temp, n=k) so mode-sharpening vs. coverage
+        regressions are both visible. A single-sample score hides
+        both signals.
 
         Args:
-            num_samples: Number of eval prompts to generate
+            num_samples: Number of eval prompts to generate.
 
         Returns:
-            Dict with accuracy, correct, total, format_rate
+            Dict with accuracy, correct, total, format_rate, format_ok.
         """
         eval_task = SumDigitsTask(seed=99)
         eval_prompts = []
         eval_answers = []
-        eval_questions = []
         for _ in range(num_samples):
             question, answer = eval_task.create_question()
             eval_prompts.append(self.system_prompt + "\n\n" + question)
             eval_answers.append(answer)
-            eval_questions.append(question)
 
-        # Generate on eval prompts
-        episodes = self._get_rank_0_value(
-            self.generator.generate.call(eval_prompts, eval_answers).get()
+        completions = self._get_rank_0_value(
+            self.generator.generate.call(eval_prompts).get()
         )
 
-        # Score: check first episode per prompt (episodes are ordered by prompt)
+        # Score the first sample per prompt. Completions come back in
+        # prompt_idx order, length num_samples * n.
+        n = self.config.generator.sampling.n
         correct = 0
         format_ok = 0
-        samples_per_prompt = self.config.generator.num_samples_per_prompt
-        for i, (question, answer) in enumerate(zip(eval_questions, eval_answers)):
-            ep = episodes[i * samples_per_prompt]
-            extracted = extract_answer(ep.text)
-            is_correct = extracted == int(answer)
-            has_tag = bool(re.search(r"\[ANSWER\]", ep.text))
-            correct += int(is_correct)
-            format_ok += int(has_tag)
+        for i, answer in enumerate(eval_answers):
+            c = completions[i * n]
+            extracted = extract_answer(c.text)
+            correct += int(extracted == int(answer))
+            format_ok += int(bool(re.search(r"\[ANSWER\]", c.text)))
 
         if self.config.log_samples:
-            _log_samples(episodes)
+            seen: set[int] = set()
+            for c in completions:
+                if c.prompt_idx in seen:
+                    continue
+                seen.add(c.prompt_idx)
+                extracted = extract_answer(c.text)
+                expected = eval_answers[c.prompt_idx]
+                is_correct = extracted == int(expected)
+                mark = "+" if is_correct else "-"
+                logger.info(f"  [{mark}] expected={expected} extracted={extracted}")
+                logger.info(
+                    f"       A: {c.text[:300].replace(chr(10), ' ').strip()}"
+                )
 
         result = {
             "accuracy": correct / num_samples,
@@ -527,30 +544,53 @@ class RLTrainer(Configurable):
 
             step_start: float = time.perf_counter()
 
-            # Fully sync RL loop (GRPO)
-            # 1. Generator produces flat list of Episodes with group_id
-            # TODO: Create a queue to use all episodes from all GPUs
-            episodes = self._get_rank_0_value(
-                self.generator.generate.call(train_prompts, train_answers).get()
+            # 1. Generator produces flat list of Completions.
+            # TODO: Create a queue to use all completions from all GPUs.
+            completions = self._get_rank_0_value(
+                self.generator.generate.call(train_prompts).get()
             )
 
-            # 2. Grader computes rewards per episode
-            episodes = self._get_rank_0_value(
-                self.grader.score.call(episodes).get(), has_gpus=False
+            # 2. Group completions by prompt_idx so the grader can batch
+            #    reward_fn per prompt. train_answers is already indexed
+            #    by prompt so it stays parallel to the group list.
+            by_prompt: dict[int, list[Completion]] = defaultdict(list)
+            for c in completions:
+                by_prompt[c.prompt_idx].append(c)
+            completions_per_prompt = [
+                by_prompt[pidx] for pidx in range(len(train_prompts))
+            ]
+
+            # 3. Grader assigns a reward per completion.
+            scored = self._get_rank_0_value(
+                self.grader.score.call(completions_per_prompt, train_answers).get(),
+                has_gpus=False,
             )
 
-            # 3. Controller computes GRPO advantages (normalize within group)
-            groups: dict[str, list[int]] = defaultdict(list)
-            for idx, ep in enumerate(episodes):
-                groups[ep.group_id].append(idx)
-            for indices in groups.values():
-                rewards = torch.tensor([episodes[i].reward for i in indices])
-                mean_reward = rewards.mean().item()
-                for i in indices:
-                    episodes[i].advantage = episodes[i].reward - mean_reward
+            # 4. Compute mean-baseline advantages per prompt and build a
+            #    flat Episode list in scored-iteration order.
+            rewards_by_prompt: dict[int, list[float]] = defaultdict(list)
+            for sc in scored:
+                rewards_by_prompt[sc.completion.prompt_idx].append(sc.reward)
+            group_mean: dict[int, float] = {
+                pidx: sum(rs) / len(rs) for pidx, rs in rewards_by_prompt.items()
+            }
+
+            episodes: list[Episode] = [
+                Episode(
+                    policy_version=sc.completion.policy_version,
+                    prompt_idx=sc.completion.prompt_idx,
+                    prompt_token_ids=sc.completion.prompt_token_ids,
+                    text=sc.completion.text,
+                    token_ids=sc.completion.token_ids,
+                    token_logprobs=sc.completion.token_logprobs,
+                    reward=sc.reward,
+                    advantage=sc.reward - group_mean[sc.completion.prompt_idx],
+                )
+                for sc in scored
+            ]
 
             if self.config.log_samples:
-                _log_samples(episodes)
+                _log_samples(episodes, train_answers)
 
             # 4. Trainer updates policy using pre-collated batches
             maybe_sharded_episodes = self._shard_episodes(episodes)

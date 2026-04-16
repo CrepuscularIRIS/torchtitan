@@ -9,21 +9,23 @@ from collections.abc import Callable
 
 import torch
 from monarch.actor import Actor, endpoint
-from torchtitan.experiments.rl.types import Episode
+from torchtitan.experiments.rl.types import Completion, ScoredCompletion
 
 logger = logging.getLogger(__name__)
 
 
 class Grader(Actor):
     """
-    Evaluates completions and assigns rewards to episodes.
+    Scores generated completions using a reward function.
 
-    The Grader receives a flat list of Episodes and computes rewards
-    using a reward function. It scores each episode independently.
+    Consumes pre-grouped completions (one group per prompt, each sharing
+    the same ``expected_answer``) so that ``reward_fn`` can be called
+    with its natural batched shape. The grader does not compute the
+    grouping itself -- the controller provides it.
 
     Args:
-        reward_fn: Reward function that takes (completions: list[str], expected_answer: str)
-                   and returns a tensor of rewards.
+        reward_fn: Callable ``(completions: list[str], expected_answer: str) -> torch.Tensor``
+            returning one reward per input completion.
     """
 
     def __init__(
@@ -35,31 +37,42 @@ class Grader(Actor):
         logger.info("Grader initialized")
 
     @endpoint
-    async def score(self, episodes: list[Episode]) -> list[Episode]:
-        """
-        Score episodes by computing rewards.
-
-        Calls the reward_fn with each episode's completion text and
-        expected answer, then sets the reward on each episode.
+    async def score(
+        self,
+        completions_per_prompt: list[list[Completion]],
+        expected_answers: list[str],
+    ) -> list[ScoredCompletion]:
+        """Score pre-grouped completions.
 
         Args:
-            episodes: Flat list of Episodes to score.
+            completions_per_prompt: One inner list per prompt; each
+                inner list contains the completions sharing that prompt.
+            expected_answers: One expected answer per prompt, parallel
+                to ``completions_per_prompt``.
 
         Returns:
-            Episodes with rewards filled in.
+            Flat list of ScoredCompletions in the order produced by
+            iterating ``completions_per_prompt`` then each inner list.
         """
-        logger.debug(f"Grader scoring {len(episodes)} episodes...")
-
-        # Score each episode individually
-        for ep in episodes:
-            rewards = self.reward_fn([ep.text], ep.expected_answer)
-            ep.reward = rewards[0].item()
-
-        all_rewards = torch.tensor([ep.reward for ep in episodes])
-        logger.debug(
-            f"Grader finished scoring: "
-            f"reward_mean={all_rewards.mean().item():.4f}, "
-            f"reward_std={all_rewards.std().item():.4f}"
+        assert len(completions_per_prompt) == len(expected_answers), (
+            f"expected parallel lists, got "
+            f"{len(completions_per_prompt)} groups vs "
+            f"{len(expected_answers)} expected_answers"
         )
 
-        return episodes
+        scored: list[ScoredCompletion] = []
+        all_rewards: list[float] = []
+        for group, expected in zip(completions_per_prompt, expected_answers):
+            rewards = self.reward_fn([c.text for c in group], expected)
+            for c, r in zip(group, rewards.tolist()):
+                scored.append(ScoredCompletion(completion=c, reward=r))
+                all_rewards.append(r)
+
+        rewards_t = torch.tensor(all_rewards)
+        logger.debug(
+            f"Grader finished scoring {len(scored)} completions: "
+            f"reward_mean={rewards_t.mean().item():.4f}, "
+            f"reward_std={rewards_t.std().item():.4f}"
+        )
+
+        return scored
