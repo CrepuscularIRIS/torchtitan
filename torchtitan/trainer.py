@@ -539,7 +539,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # entire step will not be executed.
                 raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
-            ntokens_batch = labels.numel()
+            cp_degree = self.parallel_dims.cp
+            ntokens_batch = labels.numel() // cp_degree
             self.ntokens_seen += ntokens_batch
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
             self.metrics_processor.data_loading_times.append(
