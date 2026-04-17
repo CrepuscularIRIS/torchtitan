@@ -229,19 +229,16 @@ def _dispatch_fake(
     pad_multiple: int | None,
     handle: DispatchHandle,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fake dispatch for torch.compile tracing."""
+    """Fake dispatch for torch.compile tracing.
+
+    Uses ``ctx.new_dynamic_size()`` so the output token dimension is a
+    ``SymInt``, enabling downstream graph passes (paged stash, SAC) to
+    identify dynamically-shaped activations via ``isinstance(shape[0],
+    torch.SymInt)``.
+    """
+    ctx = torch.library.get_ctx()
     num_local_experts = num_experts // _buffer.group_size
-    if non_blocking:
-        out_tokens = _num_permuted_tokens_for_non_blocking(
-            x.shape[0],
-            _buffer.group_size,
-            num_local_experts,
-            topk_idx.shape[1],
-            moe_expert_capacity_factor,  # pyrefly: ignore [bad-argument-type]
-            pad_multiple=pad_multiple,
-        )
-    else:
-        out_tokens = x.shape[0]
+    out_tokens = ctx.new_dynamic_size()
     hidden = x.new_empty(out_tokens, x.shape[1])
     # scores must have out_tokens elements (not 0) so the tracer takes the
     # multiplication branch in _apply_scores.  The CUDA impl may return

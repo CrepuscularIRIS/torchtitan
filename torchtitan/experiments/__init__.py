@@ -8,7 +8,6 @@ _supported_experiments = frozenset(
     [
         "graph_trainer.llama3",
         "graph_trainer.deepseek_v3",
-        "graph_trainer.qwen3",
         "vlm",
         "transformers_modeling_backend",
         "autoparallel.llama3",
@@ -16,5 +15,6 @@ _supported_experiments = frozenset(
         "autoparallel.local_map_deepseek_v3",
         "ft.llama3",
         "rl",
+        "cuda_graphable_moe.deepseek_v3",
     ]
 )
