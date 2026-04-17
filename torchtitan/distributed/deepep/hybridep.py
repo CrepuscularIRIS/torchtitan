@@ -28,7 +28,7 @@ from torch._library.opaque_object import (
     register_opaque_type,
 )
 from torch.distributed import ProcessGroup
-from torch.utils._python_dispatch import _disable_current_modes
+
 
 _buffer: Any = None  # Global buffer instance
 
@@ -93,12 +93,7 @@ def _apply_scores(
 # Custom op registration for torch.compile and SAC compatibility
 _handle_type = get_opaque_type_name(DispatchHandle)
 
-torch.library.define(
-    "hybridep::dispatch",
-    f"(Tensor x, Tensor topk_idx, Tensor topk_weights, int num_experts, "
-    f"bool non_blocking, float? moe_expert_capacity_factor, int? pad_multiple) -> (Tensor, Tensor, Tensor, {_handle_type})",
-)
-
+# combine takes the DispatchHandle as input (read-only).
 torch.library.define(
     "hybridep::combine",
     f"(Tensor x, {_handle_type} handle, int num_tokens, int? pad_multiple) -> Tensor",
@@ -136,17 +131,22 @@ def _num_permuted_tokens_for_non_blocking(
     return n
 
 
-@torch.library.impl("hybridep::dispatch", "CUDA")
-def _dispatch_impl(
+# dispatch takes the DispatchHandle as an INPUT so it flows through the
+# compile graph as a placeholder, avoiding default_partition crash on
+# non-tensor mid-graph outputs.
+@torch.library.custom_op("hybridep::dispatch", mutates_args=[])
+def hybridep_dispatch(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
-    non_blocking: bool = False,
-    moe_expert_capacity_factor: float | None = None,
-    pad_multiple: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
-    """
+    non_blocking: bool,
+    moe_expert_capacity_factor: float | None,
+    pad_multiple: int | None,
+    handle: DispatchHandle,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch tokens to experts via HybridEP all-to-all.
+
     DeepEP's dispatch_with_permute needs to know the output buffer size
     (num_permuted_tokens) for the fused permute kernel.
 
@@ -155,6 +155,8 @@ def _dispatch_impl(
     * **non_blocking=False (blocking)** — DeepEP does cudaStreamSynchronize,
       then reads tokens_per_expert from pinned CPU memory to compute the
       exact num_permuted_tokens on the host.
+    * **handle** — DispatchHandle passed as an input and mutated in-place to
+      store the deep_ep handle, which combine needs to reverse the permutation.
     """
     global _buffer
     if _buffer is None:
@@ -185,7 +187,7 @@ def _dispatch_impl(
             pad_multiple=pad_multiple,
         )
 
-    hidden, scores, _, tokens_per_expert, handle = _buffer.dispatch_with_permute(
+    hidden, scores, _, tokens_per_expert, raw_handle = _buffer.dispatch_with_permute(
         hidden=x,
         routing_map=routing_map,
         probs=probs,
@@ -210,19 +212,23 @@ def _dispatch_impl(
     if tokens_per_expert.device != x.device:
         tokens_per_expert = tokens_per_expert.to(x.device)
 
-    return hidden, scores, tokens_per_expert, DispatchHandle(value=handle)
+    # Mutate handle in-place — opaque to the compiler
+    handle.value = raw_handle
+
+    return hidden, scores, tokens_per_expert
 
 
-@torch.library.register_fake("hybridep::dispatch")
+@hybridep_dispatch.register_fake
 def _dispatch_fake(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
-    non_blocking: bool = False,
-    moe_expert_capacity_factor: float | None = None,
-    pad_multiple: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
+    non_blocking: bool,
+    moe_expert_capacity_factor: float | None,
+    pad_multiple: int | None,
+    handle: DispatchHandle,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fake dispatch for torch.compile tracing."""
     num_local_experts = num_experts // _buffer.group_size
     if non_blocking:
@@ -237,16 +243,18 @@ def _dispatch_fake(
     else:
         out_tokens = x.shape[0]
     hidden = x.new_empty(out_tokens, x.shape[1])
-    scores = x.new_empty(0, dtype=torch.float32)
+    # scores must have out_tokens elements (not 0) so the tracer takes the
+    # multiplication branch in _apply_scores.  The CUDA impl may return
+    # torch.empty(0) when probs are absent, but in practice probs are always
+    # provided via indices_to_map, so out_tokens is the correct trace shape.
+    scores = x.new_empty(out_tokens, dtype=torch.float32)
     tpe = x.new_empty(num_local_experts, dtype=torch.int64)
-    return hidden, scores, tpe, DispatchHandle()
+    return hidden, scores, tpe
 
 
 @torch.library.impl("hybridep::combine", "CUDA")
 def _combine_impl(
-    x: torch.Tensor,
-    handle: DispatchHandle,
-    num_tokens: int,
+    x: torch.Tensor, handle: DispatchHandle, num_tokens: int,
     pad_multiple: int | None = None,
 ) -> torch.Tensor:
     """CUDA combine: reverse dispatch permutation via opaque handle."""
@@ -260,49 +268,52 @@ def _combine_impl(
 
 @torch.library.register_fake("hybridep::combine")
 def _combine_fake(
-    x: torch.Tensor,
-    handle: DispatchHandle,
-    num_tokens: int,
+    x: torch.Tensor, handle: DispatchHandle, num_tokens: int,
     pad_multiple: int | None = None,
 ) -> torch.Tensor:
     """Fake combine for torch.compile tracing."""
     return x.new_empty(num_tokens, x.shape[1])
 
 
-def _dispatch_backward(ctx, grad_hidden, grad_scores, grad_tpe, grad_handle):
+def _dispatch_backward(ctx, grad_hidden, grad_scores, grad_tpe):
     """Backward: gather gradients via combine."""
     if grad_hidden is None:
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     dispatch_handle = ctx.dispatch_handle
-    if dispatch_handle is None or dispatch_handle.value is None:
-        raise RuntimeError("DispatchHandle not found in dispatch backward")
-
     (topk_idx,) = ctx.saved_tensors
-    grad_x, grad_probs_dense = _buffer.combine_with_unpermute(
-        hidden=grad_hidden,
-        probs=(
-            grad_scores if grad_scores is not None and grad_scores.numel() > 0 else None
-        ),
-        handle=dispatch_handle.value,
-    )
-    grad_x = grad_x.to(ctx.input_dtype)
 
-    # grad_probs_dense is [num_tokens, num_experts]; gather back to sparse [num_tokens, top_k]
-    grad_weights = (
-        grad_probs_dense.gather(dim=1, index=topk_idx)
-        if grad_probs_dense is not None
-        else None
-    )
-    # Gradients for: x, topk_idx, topk_weights, num_experts, non_blocking,
-    #                moe_expert_capacity_factor, pad_multiple
-    return grad_x, None, grad_weights, None, None, None, None
+    # During AOT autograd backward tracing, the handle is a fake —
+    # fall back to zero tensors with the correct shapes.
+    if dispatch_handle is None or dispatch_handle.value is None:
+        grad_x = grad_hidden.new_zeros(topk_idx.shape[0], grad_hidden.shape[-1])
+        grad_weights = grad_hidden.new_zeros(topk_idx.shape)
+    else:
+        grad_x, grad_probs_dense = _buffer.combine_with_unpermute(
+            hidden=grad_hidden,
+            probs=grad_scores
+            if grad_scores is not None and grad_scores.numel() > 0
+            else None,
+            handle=dispatch_handle.value,
+        )
+        grad_x = grad_x.to(ctx.input_dtype)
+
+        # grad_probs_dense is [num_tokens, num_experts]; gather back to sparse [num_tokens, top_k]
+        grad_weights = (
+            grad_probs_dense.gather(dim=1, index=topk_idx)
+            if grad_probs_dense is not None
+            else None
+        )
+
+    # 8 gradients for 8 inputs: x, topk_idx, topk_weights, num_experts,
+    # non_blocking, moe_expert_capacity_factor, pad_multiple, handle
+    return grad_x, None, grad_weights, None, None, None, None, None
 
 
 def _dispatch_setup_context(ctx, inputs, output):
     """Save context for dispatch backward."""
-    x, topk_idx, _, _, _, _, _ = inputs
-    _, _, _, dispatch_handle = output
+    # handle is now the 8th input (not part of output)
+    x, topk_idx, _, _, _, _, _, dispatch_handle = inputs
     ctx.dispatch_handle = dispatch_handle
     ctx.input_dtype = x.dtype
     ctx.save_for_backward(topk_idx)
@@ -311,16 +322,22 @@ def _dispatch_setup_context(ctx, inputs, output):
 def _combine_backward(ctx, grad_combined):
     """Backward: scatter gradients via dispatch."""
     dispatch_handle = ctx.dispatch_handle
-    if dispatch_handle is None or dispatch_handle.value is None:
-        raise RuntimeError("DispatchHandle not found in combine backward")
 
-    grad_x, _, _, _, _ = _buffer.dispatch_with_permute(
-        hidden=grad_combined,
-        scaling_factor=None,
-        handle=dispatch_handle.value,
-        num_permuted_tokens=ctx.num_permuted_tokens,
-        pad_multiple=ctx.pad_multiple,
-    )
+    # During AOT autograd backward tracing, the handle is a fake —
+    # fall back to a zero tensor with the correct shape.
+    if dispatch_handle is None or dispatch_handle.value is None:
+        grad_x = grad_combined.new_zeros(
+            ctx.num_permuted_tokens, grad_combined.shape[-1]
+        )
+    else:
+        grad_x, _, _, _, _ = _buffer.dispatch_with_permute(
+            hidden=grad_combined,
+            scaling_factor=None,
+            handle=dispatch_handle.value,
+            num_permuted_tokens=ctx.num_permuted_tokens,
+            pad_multiple=ctx.pad_multiple,
+        )
+
     # Gradients for: x, handle, num_tokens, pad_multiple
     return grad_x, None, None, None
 
@@ -333,8 +350,8 @@ def _combine_setup_context(ctx, inputs, output):
     ctx.pad_multiple = pad_multiple
 
 
-torch.library.register_autograd(
-    "hybridep::dispatch", _dispatch_backward, setup_context=_dispatch_setup_context
+hybridep_dispatch.register_autograd(
+    _dispatch_backward, setup_context=_dispatch_setup_context
 )
 torch.library.register_autograd(
     "hybridep::combine", _combine_backward, setup_context=_combine_setup_context
@@ -366,8 +383,7 @@ def get_buffer(
         raise AssertionError("HybridEP FP8 dispatch not yet supported")
 
     try:
-        # pyrefly: ignore [missing-import, missing-module-attribute]
-        from deep_ep import HybridEPBuffer
+        from deep_ep import HybridEPBuffer  # pyrefly: ignore [missing-import]
     except ImportError as e:
         raise ImportError(
             "HybridEP requires deep_ep library. "
@@ -408,6 +424,7 @@ def dispatch_tokens(
     group: ProcessGroup,
     score_before_experts: bool = True,
     non_blocking_expert_capacity_factor: float | None = None,
+    dispatch_handle: DispatchHandle = None,
     pad_multiple: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DispatchState]:
     """Dispatch tokens to experts via HybridEP all-to-all.
@@ -423,7 +440,8 @@ def dispatch_tokens(
         non_blocking_expert_capacity_factor: None = blocking mode (default).
             float in (0, 1] = non-blocking mode; pre-sizes the permute output
             tensor as num_tokens × ep_size × min(num_local_experts, top_k) × cf,
-            aligned to pad_multiple.
+            aligned for MXFP8.
+        dispatch_handle: DispatchHandle to pass through the graph (AOT mode).
         pad_multiple: Pad per-expert token groups to this multiple (e.g. 32 for
             MXFP8). None means no padding.
 
@@ -435,11 +453,12 @@ def dispatch_tokens(
     selected_experts_indices = selected_experts_indices.contiguous()
     top_scores = top_scores.contiguous()
 
-    # Hide buffer setup from SAC's __torch_dispatch__ via _disable_current_modes().
-    # Buffer.__init__ calls all_gather_object() which triggers aten._to_copy
-    # (CUDA→CPU), a MUST_SAVE op in our SAC policy. These are infrastructure
-    # ops, not model compute, and must not enter SAC's FIFO cache.
-    with _disable_current_modes():
+    # Skip buffer init during Dynamo tracing — the pybind11 HybridEPBuffer
+    # constructor is not traceable. The buffer is pre-initialized in
+    # parallelize.py before AOT compilation begins. This call is kept as a
+    # fallback for non-AOT paths (eager, JIT) and is a no-op when the buffer
+    # already exists (get_buffer checks needs_reinit).
+    if not torch.compiler.is_compiling():
         get_buffer(
             group=group,
             hidden_dim=hidden_states.shape[1],
@@ -447,11 +466,13 @@ def dispatch_tokens(
             num_local_experts=num_local_experts,
         )
 
+    if dispatch_handle is None:
+        dispatch_handle = DispatchHandle()
+
     (
         hidden,
         permuted_scores,
         tokens_per_expert,
-        dispatch_handle,
     ) = torch.ops.hybridep.dispatch(
         hidden_states,
         selected_experts_indices,
@@ -460,6 +481,7 @@ def dispatch_tokens(
         non_blocking,
         non_blocking_expert_capacity_factor,
         pad_multiple,
+        dispatch_handle,
     )
 
     hidden, permuted_scores = _apply_scores(

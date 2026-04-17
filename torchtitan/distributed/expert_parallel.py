@@ -385,6 +385,15 @@ class DeepEPExpertParallel(BaseExpertParallel):
         # instead of recomputing them. This must happen before apply_ac.
         if comm_backend == "hybridep":
             from torchtitan.distributed.deepep import hybridep  # noqa: F401
+            from torchtitan.distributed.deepep.hybridep import DispatchHandle
+
+            # Pre-create a per-instance DispatchHandle for hybridep. Dynamo lifts
+            # this as a graph input (placeholder) because it's a reference-type
+            # OpaqueBase attribute on the module. This avoids returning the handle
+            # as a mid-graph output from the custom op, which would crash
+            # default_partition (it doesn't handle non-tensor mid-graph outputs).
+            # The handle is mutated in-place at runtime by hybridep::dispatch.
+            self._dispatch_handle = DispatchHandle()
         else:
             from torchtitan.distributed.deepep import deepep  # noqa: F401
 
@@ -407,6 +416,7 @@ class DeepEPExpertParallel(BaseExpertParallel):
                 num_local_experts,
                 num_experts,
                 ep_group,
+                dispatch_handle=self._dispatch_handle,
                 score_before_experts=self.score_before_experts,
                 non_blocking_expert_capacity_factor=self.hybridep_non_blocking_expert_capacity_factor,
                 pad_multiple=self.pad_multiple,

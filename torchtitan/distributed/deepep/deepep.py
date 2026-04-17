@@ -243,7 +243,6 @@ torch.library.register_autograd(
 )
 
 
-@torch.compiler.disable()
 def sync_combine() -> None:
     """Synchronize the current CUDA stream with the pending combine operation.
 
@@ -253,8 +252,10 @@ def sync_combine() -> None:
     the combine to finish.
 
     torch.compile Compatibility:
-        Decorated with @torch.compiler.disable() to always run in eager mode.
-        This avoids issues with CUDA event operations not being traceable.
+        Guarded with torch.compiler.is_compiling() so that during AOT tracing
+        (fullgraph=True) the function is a no-op — the pending event is None
+        during tracing anyway. At runtime outside compile, the event wait
+        executes normally.
 
     Process Isolation:
         Each GPU process has its own Python interpreter, so this module-level
@@ -279,6 +280,11 @@ def sync_combine() -> None:
     was already synced or if no combine operation is pending.
     """
     global _pending_combine_event
+
+    # Skip during torch.compile tracing — event is None during tracing,
+    # and CUDA event ops are not traceable.
+    if torch.compiler.is_compiling():
+        return
 
     if _pending_combine_event is not None:
         _pending_combine_event.current_stream_wait()
