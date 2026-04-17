@@ -243,7 +243,6 @@ torch.library.register_autograd(
 )
 
 
-@torch.compiler.disable()
 def sync_combine() -> None:
     """Synchronize the current CUDA stream with the pending combine operation.
 
@@ -279,6 +278,8 @@ def sync_combine() -> None:
     was already synced or if no combine operation is pending.
     """
     global _pending_combine_event
+    if torch.compiler.is_compiling():
+        return
 
     if _pending_combine_event is not None:
         _pending_combine_event.current_stream_wait()

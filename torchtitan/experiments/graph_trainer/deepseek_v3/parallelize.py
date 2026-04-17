@@ -115,6 +115,10 @@ def parallelize_deepseekv3(
         )
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
 
+    comm_backend = parallelism.expert_parallel_comm_backend
+    if comm_backend == "hybridep":
+        from torchtitan.distributed.deepep import hybridep  # noqa: F401
+
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         from torchtitan.components.quantization import find_pad_multiple
 
@@ -126,6 +130,8 @@ def parallelize_deepseekv3(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
+            comm_backend=comm_backend,
+            hybridep_non_blocking_expert_capacity_factor=parallelism.hybridep_non_blocking_expert_capacity_factor,
             pad_multiple=pad_multiple,
         )
 
@@ -193,6 +199,25 @@ def parallelize_deepseekv3(
 
         logger.info(
             "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode
+        )
+
+    if comm_backend == "hybridep" and parallel_dims.ep_enabled:
+        from torchtitan.distributed.deepep.hybridep import get_buffer
+
+        ep_group = parallel_dims.get_mesh("ep").get_group()
+        moe_config = next(l.moe for l in model.config.layers if l.moe is not None)
+        num_local_experts = moe_config.num_experts // parallel_dims.ep
+        hidden_dim = model.config.dim
+        num_tokens = training.local_batch_size * training.seq_len
+        get_buffer(
+            group=ep_group,
+            hidden_dim=hidden_dim,
+            num_tokens=num_tokens,
+            num_local_experts=num_local_experts,
+        )
+        logger.info(
+            f"Pre-initialized HybridEP buffer (hidden_dim={hidden_dim}, "
+            f"num_tokens={num_tokens}, num_local_experts={num_local_experts})"
         )
 
     # Apply compilation based on mode
