@@ -187,7 +187,7 @@ def hybridep_dispatch(
             pad_multiple=pad_multiple,
         )
 
-    hidden, scores, _, tokens_per_expert, raw_handle = _buffer.dispatch_with_permute(
+    hidden, scores, overflow_flag, tokens_per_expert, raw_handle = _buffer.dispatch_with_permute(
         hidden=x,
         routing_map=routing_map,
         probs=probs,
@@ -198,14 +198,10 @@ def hybridep_dispatch(
         non_blocking=non_blocking,
     )
 
-    # NOTE: In non_blocking mode, overflow_flag lives on GPU so checking it
-    # (.item()) would force cudaStreamSynchronize, defeating the purpose.
-    # Overflow is governed by num_permuted_tokens (the output buffer capacity
-    # for the fused permute kernel) — tokens whose permuted offset exceeds
-    # that limit are silently dropped.  Correct sizing of num_permuted_tokens
-    # via _num_permuted_tokens_for_non_blocking is therefore critical:
-    # capacity_factor=1.0 → worst-case sizing, no drops, most memory;
-    # capacity_factor<1.0 → less memory, but tokens may be dropped.
+    # Store overflow_flag for post-step checking.  In non_blocking mode this is a
+    # GPU tensor — checking it (.item()) requires D2H sync, so we defer to after
+    # the full training step completes.
+    _buffer._overflow_flag = overflow_flag
 
     if scores is None:
         scores = torch.empty(0, device=x.device, dtype=torch.float32)
@@ -512,9 +508,25 @@ def combine_tokens(
     )
 
 
+def check_hybridep_over_budget() -> torch.Tensor:
+    """Check if HybridEP dispatch exceeded capacity budget (tokens dropped).
+
+    Returns a GPU bool tensor.  Safe to call after the training step completes
+    (the .item() D2H sync is acceptable post-step).
+    """
+    if (
+        _buffer is not None
+        and hasattr(_buffer, "_overflow_flag")
+        and _buffer._overflow_flag is not None
+    ):
+        return (_buffer._overflow_flag != 0).view(1)
+    return torch.zeros(1, dtype=torch.bool, device="cuda")
+
+
 __all__ = [
     "dispatch_tokens",
     "combine_tokens",
+    "check_hybridep_over_budget",
     "DispatchState",
     "DispatchHandle",
 ]

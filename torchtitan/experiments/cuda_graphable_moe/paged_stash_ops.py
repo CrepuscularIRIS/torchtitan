@@ -14,15 +14,36 @@ memory fragmentation for MoE expert layers with dynamic token counts.
 Custom ops are registered via torch.library so they can be inserted into FX
 graphs by the graph-based paged SAC pass.
 
-page_record format: [num_tokens, page_id_0, page_id_1, ...]
-This encodes num_tokens as the first element, allowing it to travel through
-the fwd→bwd boundary without needing extra saved tensors or symbolic expressions.
+3-level overflow defense (mirrors Megatron):
+
+  Level 1 (Host spillover): When CUDA pages exhausted, the Triton copy kernel
+  falls back to a pinned host buffer. The pop kernel reads ``spilled_to_host``
+  to select the source. All branching is data-dependent inside the kernel —
+  CUDA-graph compatible.
+
+  Level 2 (Cross-rank detection): After each step, ``all_reduce`` of 3 flags
+  (stash overflow, HybridEP over-budget, host spill) ensures all ranks agree.
+
+  Level 3 (Retry): On full overflow (both CUDA and host exhausted) or
+  over-budget, zero grads, grow buffers, reset CUDA graphs, rerun fwd/bwd.
+
+page_record format: [num_tokens, spilled_to_host, page_id_0, page_id_1, ...]
+This encodes num_tokens and the spill flag in the first two elements, allowing
+both to travel through the fwd→bwd boundary without extra saved tensors.
+
+Buffer sizing: when ``capacity_factor`` is provided to ``create_paged_buffers``,
+buffers are sized to ``max_tokens / capacity_factor`` (the balanced estimate
+under uniform routing) instead of worst-case ``max_tokens``.
 """
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from torch._functorch._activation_offloading.offload_ops import (
+    _get_or_create_transfer_stream,
+    _register_wait,
+)
 
 from torchtitan.tools.logging import logger
 
@@ -30,35 +51,115 @@ GLOBAL_BLOCK_SIZE = 1024
 
 
 # ---------------------------------------------------------------------------
-# Triton kernels
+# Module-level buffer registry — accessed by custom ops at runtime
+# ---------------------------------------------------------------------------
+# Following the ao::offload pattern (which uses module-level _transfer_streams
+# and _wait_registry dicts), paged stash buffers are accessed through this
+# registry keyed by buffer ID.  The graph only carries the buffer_id as an
+# integer constant — no buffer tensors appear as graph arguments, get_attr
+# nodes, or placeholders.  This avoids deepcopy and DTensor issues entirely.
+
+_PAGED_STASH_REGISTRY: dict[int, "PagedStashBuffer"] = {}
+
+
+def register_paged_stash_buffer(buf: "PagedStashBuffer") -> int:
+    """Register a buffer and return its ID for use in graph ops."""
+    buf_id = id(buf)
+    _PAGED_STASH_REGISTRY[buf_id] = buf
+    return buf_id
+
+
+def unregister_paged_stash_buffer(buf_id: int) -> None:
+    """Remove a buffer from the registry."""
+    _PAGED_STASH_REGISTRY.pop(buf_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Triton kernels — dual CUDA/host buffer support
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
 def _paged_stash_copy_kernel(
-    src_ptr, dst_ptr, num_tokens_ptr, free_list_ptr,
-    free_list_head_ptr, free_list_tail_ptr, free_list_capacity_ptr,
-    page_record_ptr, overflow_ptr, new_free_list_head_ptr,
+    src_ptr, cuda_dst_ptr, host_dst_ptr, num_tokens_ptr,
+    free_list_cuda_ptr, free_list_host_ptr,
+    free_list_head_ptr,  # shape (2,): [cuda_head, host_head]
+    free_list_tail_ptr,  # shape (2,): [cuda_tail, host_tail]
+    free_list_capacity_ptr,  # shape (2,): [cuda_cap, host_cap]
+    page_record_ptr, overflow_ptr, host_spill_global_ptr,
+    spilled_to_host_ptr,  # output: 0 = CUDA, 1 = host
+    new_free_list_head_ptr,  # output: shape (2,) updated heads
     PAGE_SIZE: tl.constexpr, HIDDEN_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    HAS_HOST_BUFFER: tl.constexpr,
 ):
+    """Copy tokens to paged stash: try CUDA first (fast path), then host if CUDA full."""
     pid = tl.program_id(axis=0)
     num_blocks = tl.num_programs(axis=0)
+
+    # Load overflow first — if already set, skip entirely
+    overflow = tl.load(overflow_ptr)
+
     num_tokens = tl.load(num_tokens_ptr)
-    free_list_head = tl.load(free_list_head_ptr)
-    free_list_tail = tl.load(free_list_tail_ptr)
-    free_list_capacity = tl.load(free_list_capacity_ptr)
-    avail_pages = free_list_tail - free_list_head
     required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
-    overflow_detected = avail_pages < required_pages
-    if pid == 0 and overflow_detected:
-        tl.store(overflow_ptr, 1)
-    if overflow_detected:
+
+    # Load CUDA state
+    head_cuda = tl.load(free_list_head_ptr)
+    head_host = tl.load(free_list_head_ptr + 1)
+    tail_cuda = tl.load(free_list_tail_ptr)
+    cap_cuda = tl.load(free_list_capacity_ptr)
+
+    avail_cuda = tail_cuda - head_cuda
+    use_cuda = avail_cuda >= required_pages
+
+    # Assume CUDA path
+    spill = 0
+    dst_ptr = cuda_dst_ptr
+    free_list_ptr = free_list_cuda_ptr
+    head = head_cuda
+    cap = cap_cuda
+    new_head_cuda = head_cuda + required_pages
+    new_head_host = head_host
+
+    if overflow == 1:
+        # Already overflowed — preserve heads, don't copy
+        if pid == 0:
+            tl.store(new_free_list_head_ptr, head_cuda)
+            tl.store(new_free_list_head_ptr + 1, head_host)
         return
+
+    # When CUDA is full: try host
+    if not use_cuda:
+        tail_host = tl.load(free_list_tail_ptr + 1)
+        cap_host = tl.load(free_list_capacity_ptr + 1)
+        use_host = HAS_HOST_BUFFER == 1 and (tail_host - head_host) >= required_pages
+        if use_host:
+            spill = 1
+            dst_ptr = host_dst_ptr
+            free_list_ptr = free_list_host_ptr
+            head = head_host
+            cap = cap_host
+            new_head_cuda = head_cuda
+            new_head_host = head_host + required_pages
+        else:
+            # Both CUDA and host exhausted — overflow
+            if pid == 0:
+                tl.store(overflow_ptr, 1)
+                tl.store(spilled_to_host_ptr, 1)
+                tl.store(new_free_list_head_ptr, head_cuda)
+                tl.store(new_free_list_head_ptr + 1, head_host)
+            return
+
+    if pid == 0:
+        tl.store(spilled_to_host_ptr, spill)
+        if spill == 1:
+            tl.store(host_spill_global_ptr, 1)
+
+    # Copy loop: strided over tokens
     token_idx = pid
     while token_idx < num_tokens:
         page_slot = token_idx // PAGE_SIZE
         token_in_page = token_idx % PAGE_SIZE
-        free_list_idx = (free_list_head + page_slot) % free_list_capacity
+        free_list_idx = (head + page_slot) % cap
         page_id = tl.load(free_list_ptr + free_list_idx)
         if token_in_page == 0:
             tl.store(page_record_ptr + page_slot, page_id)
@@ -82,23 +183,61 @@ def _paged_stash_copy_kernel(
                 data = tl.load(src_base + hidden_offsets)
                 tl.store(dst_base + hidden_offsets, data)
         token_idx += num_blocks
+
     if pid == 0:
-        new_head = free_list_head + required_pages
-        tl.store(new_free_list_head_ptr, new_head)
+        tl.store(new_free_list_head_ptr, new_head_cuda)
+        tl.store(new_free_list_head_ptr + 1, new_head_host)
 
 
 @triton.jit
 def _paged_stash_pop_kernel(
-    src_ptr, dst_ptr, num_tokens_ptr, page_record_ptr,
-    free_list_ptr, free_list_head_ptr, free_list_tail_ptr,
-    free_list_capacity_ptr, new_free_list_tail_ptr,
+    cuda_src_ptr, host_src_ptr, dst_ptr, num_tokens_ptr,
+    page_record_ptr, spilled_to_host_ptr, overflow_ptr,
+    free_list_cuda_ptr, free_list_host_ptr,
+    free_list_tail_ptr,  # shape (2,): [cuda_tail, host_tail]
+    free_list_capacity_ptr,  # shape (2,)
+    new_free_list_tail_ptr,  # output: shape (2,) updated tails
     PAGE_SIZE: tl.constexpr, HIDDEN_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
+    """Reload tokens from paged stash; reads spilled_to_host to select source."""
     pid = tl.program_id(axis=0)
     num_blocks = tl.num_programs(axis=0)
+
+    # If overflow was set, no valid data — preserve tails and return
+    overflow = tl.load(overflow_ptr)
     num_tokens = tl.load(num_tokens_ptr)
-    free_list_tail = tl.load(free_list_tail_ptr)
-    free_list_capacity = tl.load(free_list_capacity_ptr)
+    spill = tl.load(spilled_to_host_ptr)
+    required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
+
+    # Load both tails
+    tail_cuda = tl.load(free_list_tail_ptr)
+    tail_host = tl.load(free_list_tail_ptr + 1)
+    cap_cuda = tl.load(free_list_capacity_ptr)
+
+    if overflow == 1:
+        if pid == 0:
+            tl.store(new_free_list_tail_ptr, tail_cuda)
+            tl.store(new_free_list_tail_ptr + 1, tail_host)
+        return
+
+    # Assume CUDA path
+    src_ptr = cuda_src_ptr
+    free_list_ptr = free_list_cuda_ptr
+    tail = tail_cuda
+    cap = cap_cuda
+    new_tail_cuda = tail_cuda + required_pages
+    new_tail_host = tail_host
+
+    # Switch to host path if spilled
+    if spill == 1:
+        cap_host = tl.load(free_list_capacity_ptr + 1)
+        src_ptr = host_src_ptr
+        free_list_ptr = free_list_host_ptr
+        tail = tail_host
+        cap = cap_host
+        new_tail_cuda = tail_cuda
+        new_tail_host = tail_host + required_pages
+
     token_idx = pid
     while token_idx < num_tokens:
         page_slot = token_idx // PAGE_SIZE
@@ -124,33 +263,36 @@ def _paged_stash_pop_kernel(
                 data = tl.load(src_base + hidden_offsets)
                 tl.store(dst_base + hidden_offsets, data)
         if token_in_page == 0:
-            write_idx = (free_list_tail + page_slot) % free_list_capacity
+            write_idx = (tail + page_slot) % cap
             tl.store(free_list_ptr + write_idx, page_id)
         token_idx += num_blocks
+
     if pid == 0:
-        required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
-        new_tail = free_list_tail + required_pages
-        tl.store(new_free_list_tail_ptr, new_tail)
+        tl.store(new_free_list_tail_ptr, new_tail_cuda)
+        tl.store(new_free_list_tail_ptr + 1, new_tail_host)
 
 
 # ---------------------------------------------------------------------------
-# PagedStashBuffer — pre-allocated paged memory pool
+# PagedStashBuffer — pre-allocated paged memory pool with optional host buffer
 # ---------------------------------------------------------------------------
 
 
 class PagedStashBuffer:
     """Pre-allocated paged memory pool for stashing activations.
 
-    Uses a flat 2D buffer [total_tokens, hidden_size] with a circular free list
-    managed by unwrapped head/tail pointers.
+    Supports both CUDA and optional pinned host buffer for overflow fallback.
+    Uses per-buffer free lists (circular buffer) tracked as two-element state:
+    index 0 = CUDA, index 1 = host.
 
     Args:
-        num_tokens: Upper bound on tokens to store.
+        num_tokens: Maximum tokens the CUDA buffer can hold.
         hidden_size: Size of the hidden dimension.
         page_size: Number of tokens per page.
-        device: Device for the buffer ('cuda' or 'cpu').
-        overflow: Shared int64 tensor, set to 1 on OOM.
+        device: Device for the buffer.
+        overflow: Shared int64 GPU tensor, set to 1 when both CUDA and host full.
+        host_spill: Shared int64 GPU tensor, set to 1 if any activation spills to host.
         dtype: Data type for the buffer.
+        num_tokens_host: If > 0, allocate pinned host buffer with this many tokens.
     """
 
     def __init__(
@@ -160,116 +302,159 @@ class PagedStashBuffer:
         page_size: int,
         device: str | torch.device,
         overflow: torch.Tensor,
+        host_spill: torch.Tensor,
         dtype: torch.dtype,
+        num_tokens_host: int = 0,
     ):
         self.hidden_size = hidden_size
         self.page_size = page_size
-        self.num_pages = (num_tokens + page_size - 1) // page_size
-        self.total_tokens = self.num_pages * page_size
-        self.dtype = dtype
         self.device = device
+        self.dtype = dtype
         self.overflow = overflow  # shared across buffers
+        self.host_spill = host_spill  # shared across buffers
 
-        # Track (module, prefix) pairs for updating attrs after resize
-        self._registered_modules: list[tuple] = []
+        # CUDA buffer
+        self.num_cuda_pages = (num_tokens + page_size - 1) // page_size
+        self.total_cuda_tokens = self.num_cuda_pages * page_size
+        self.cuda_buffer = torch.empty(
+            (self.total_cuda_tokens, hidden_size), dtype=dtype, device=device,
+        )
 
-        if str(device) == "cpu":
-            self.buffer = torch.empty(
-                (self.total_tokens, hidden_size),
+        # Host buffer (pinned), optional
+        self.num_host_pages = (
+            (num_tokens_host + page_size - 1) // page_size
+            if num_tokens_host > 0
+            else 0
+        )
+        self.total_host_tokens = (
+            self.num_host_pages * page_size if self.num_host_pages > 0 else 0
+        )
+        if self.num_host_pages > 0:
+            self.host_buffer = torch.empty(
+                (self.total_host_tokens, hidden_size),
                 dtype=dtype,
                 device="cpu",
                 pin_memory=True,
             )
         else:
-            self.buffer = torch.empty(
-                (self.total_tokens, hidden_size),
-                dtype=dtype,
-                device=device,
-            )
+            self.host_buffer = None
 
-        # Circular free list with unwrapped head/tail pointers
-        self.free_list = torch.arange(
-            self.num_pages, dtype=torch.int64, device=device
+        # Free list state: shape (2,) — index 0 = CUDA, index 1 = host
+        # All on GPU for kernel access
+        self.free_list_head = torch.zeros(2, dtype=torch.int64, device=device)
+        self.free_list_tail = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=device,
         )
-        self.free_list_head = torch.zeros(1, dtype=torch.int64, device=device)
-        self.free_list_tail = self.num_pages * torch.ones(
-            1, dtype=torch.int64, device=device
+        self.free_list_capacity = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=device,
         )
-        self.free_list_capacity = self.num_pages * torch.ones(
-            1, dtype=torch.int64, device=device
+
+        # Free list arrays (device memory): page IDs for each buffer
+        self.free_list_cuda = torch.arange(
+            self.num_cuda_pages, dtype=torch.int64, device=device
         )
+        if self.num_host_pages > 0:
+            self.free_list_host = torch.arange(
+                self.num_host_pages, dtype=torch.int64, device=device
+            )
+        else:
+            self.free_list_host = torch.empty(0, dtype=torch.int64, device=device)
+
+        # Pre-allocated reset values (CUDA graph safe: no allocation in reset())
+        self._reset_tail = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=device,
+        )
+        self._reset_free_list_cuda = torch.arange(
+            self.num_cuda_pages, dtype=torch.int64, device=device
+        )
+        if self.num_host_pages > 0:
+            self._reset_free_list_host = torch.arange(
+                self.num_host_pages, dtype=torch.int64, device=device
+            )
+        else:
+            self._reset_free_list_host = None
 
     def __repr__(self):
         return (
-            f"PagedStashBuffer(num_pages={self.num_pages}, page_size={self.page_size}, "
+            f"PagedStashBuffer(cuda_pages={self.num_cuda_pages}, "
+            f"host_pages={self.num_host_pages}, page_size={self.page_size}, "
             f"hidden_size={self.hidden_size}, device={self.device}, dtype={self.dtype})"
         )
 
     def reset(self):
-        """Reset free list to full capacity. Called per training step."""
-        self.free_list.copy_(
-            torch.arange(self.num_pages, dtype=torch.int64, device=self.device)
-        )
+        """Reset both CUDA and host free lists. CUDA graph safe (no allocations)."""
+        self.free_list_cuda.copy_(self._reset_free_list_cuda)
         self.free_list_head.zero_()
-        self.free_list_tail.fill_(self.num_pages)
+        self.free_list_tail.copy_(self._reset_tail)
+        if self._reset_free_list_host is not None:
+            self.free_list_host.copy_(self._reset_free_list_host)
 
-    def resize(self, new_num_tokens: int) -> None:
-        """Resize buffer to new capacity.
+    def grow(self, factor: float = 2.0) -> None:
+        """Grow the CUDA buffer by the given factor.
 
-        Must be called between CUDAGraph warmup (iter 1) and capture (iter 2)
-        so that ``get_attr`` nodes in the FX graph resolve to the new tensors.
+        Invalidates any captured CUDA graphs — callers must reset the
+        CUDAGraphWrapper after calling this.  The host buffer is not grown
+        (it's a spillover safety net, not a primary store).
         """
-        old_pages = self.num_pages
-        old_tokens = self.total_tokens
-        self.num_pages = (new_num_tokens + self.page_size - 1) // self.page_size
-        self.total_tokens = self.num_pages * self.page_size
+        new_num_cuda_pages = int(self.num_cuda_pages * factor)
+        if new_num_cuda_pages <= self.num_cuda_pages:
+            return
 
-        if str(self.device) == "cpu":
-            self.buffer = torch.empty(
-                (self.total_tokens, self.hidden_size),
-                dtype=self.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-        else:
-            self.buffer = torch.empty(
-                (self.total_tokens, self.hidden_size),
-                dtype=self.dtype,
-                device=self.device,
-            )
+        old_num_cuda_pages = self.num_cuda_pages
+        self.num_cuda_pages = new_num_cuda_pages
+        self.total_cuda_tokens = self.num_cuda_pages * self.page_size
 
-        self.free_list = torch.arange(
-            self.num_pages, dtype=torch.int64, device=self.device
+        # Reallocate CUDA buffer and free list
+        self.cuda_buffer = torch.empty(
+            (self.total_cuda_tokens, self.hidden_size),
+            dtype=self.dtype,
+            device=self.device,
         )
-        self.free_list_head = torch.zeros(
-            1, dtype=torch.int64, device=self.device
-        )
-        self.free_list_tail = self.num_pages * torch.ones(
-            1, dtype=torch.int64, device=self.device
-        )
-        self.free_list_capacity = self.num_pages * torch.ones(
-            1, dtype=torch.int64, device=self.device
+        self.free_list_cuda = torch.arange(
+            self.num_cuda_pages, dtype=torch.int64, device=self.device
         )
 
-        # Update registered module attributes so get_attr resolves to new tensors
-        for module, prefix in self._registered_modules:
-            module.register_buffer(f"{prefix}_buffer", self.buffer)
-            module.register_buffer(f"{prefix}_free_list", self.free_list)
-            module.register_buffer(f"{prefix}_free_list_head", self.free_list_head)
-            module.register_buffer(f"{prefix}_free_list_tail", self.free_list_tail)
-            module.register_buffer(
-                f"{prefix}_free_list_capacity", self.free_list_capacity
-            )
+        # Update shared state tensors
+        self.free_list_head = torch.zeros(2, dtype=torch.int64, device=self.device)
+        self.free_list_tail = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.free_list_capacity = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=self.device,
+        )
 
-        logger.info(
-            "Resized PagedStashBuffer(hidden=%d, dtype=%s): "
-            "%d -> %d pages (%d -> %d tokens)",
+        # Update reset templates
+        self._reset_tail = torch.tensor(
+            [self.num_cuda_pages, self.num_host_pages],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._reset_free_list_cuda = torch.arange(
+            self.num_cuda_pages, dtype=torch.int64, device=self.device
+        )
+
+        # With the module-level registry, the buffer object itself IS the
+        # registry entry.  After grow() reallocates self.cuda_buffer etc., the
+        # registry entry reflects the new tensors automatically.  Callers must
+        # reset CUDA graphs so the next step re-captures with new pointers.
+
+        logger.warning(
+            "PagedStashBuffer grown: %d -> %d CUDA pages "
+            "(hidden_size=%d, dtype=%s)",
+            old_num_cuda_pages,
+            self.num_cuda_pages,
             self.hidden_size,
             self.dtype,
-            old_pages,
-            self.num_pages,
-            old_tokens,
-            self.total_tokens,
         )
 
 
@@ -278,38 +463,45 @@ class PagedStashBuffer:
 # ---------------------------------------------------------------------------
 
 
-def create_paged_buffers(model, ac_config, *, max_tokens):
+def create_paged_buffers(
+    model,
+    ac_config,
+    *,
+    max_tokens,
+    capacity_factor=None,
+    host_buffer_size_factor=0.0,
+):
     """Create paged stash buffers for MoE expert activations.
 
     Scans the model for GroupedExperts modules, counts stash ops per
-    (dtype, hidden_size) key, and creates one PagedStashBuffer per key
-    sized to the number of dynamic tensors that will be stashed.
+    (dtype, hidden_size) key, and creates one PagedStashBuffer per key.
 
-    Per GroupedExperts module, ``_run_experts_grouped_mm`` produces 5
-    dynamic-shaped activations that the paged stash pass force-saves:
+    Under HybridEP with capacity-factor padding, ``max_tokens`` includes the
+    padding.  When ``capacity_factor`` is provided, the CUDA buffer is sized to
+    ``max_tokens / capacity_factor`` (the balanced estimate).
 
-      - x.bf16()           [tokens, dim]         (key: dtype, dim)       × 1
-      - gmm1 output        [tokens, hidden_dim]  (key: dtype, hidden_dim)
-      - silu output        [tokens, hidden_dim]  (key: dtype, hidden_dim)
-      - gmm2 output        [tokens, hidden_dim]  (key: dtype, hidden_dim)
-      - h = silu * gmm2    [tokens, hidden_dim]  (key: dtype, hidden_dim) × 4
-
-    So 4 ops contribute to (dtype, hidden_dim) and 1 op to (dtype, dim) per module.
+    When ``host_buffer_size_factor > 0``, an additional pinned host buffer is
+    allocated for spillover when the CUDA buffer is full.
 
     Args:
         model: The transformer model to scan for GroupedExperts.
         ac_config: Activation checkpoint config with paged stash settings.
-        max_tokens: Upper bound on tokens routed to experts per step
-            (batch_size * seq_len * top_k).
+        max_tokens: Upper bound on tokens routed to experts per step.
+        capacity_factor: HybridEP capacity factor.  When set, CUDA buffers are
+            sized to ``max_tokens / capacity_factor``.
+        host_buffer_size_factor: Factor for host spillover buffer sizing.
+            0 means no host buffer.  Positive value sizes the host buffer
+            relative to the estimated tokens (same base as CUDA buffer).
 
     Returns:
-        Tuple of (buffers, overflow) where buffers is a dict mapping
-        (dtype, hidden_size) to PagedStashBuffer and overflow is the shared
-        overflow flag tensor. Returns (None, None) if no GroupedExperts found.
+        Tuple of (buffers, overflow, host_spill) where buffers is a dict mapping
+        (dtype, hidden_size) to PagedStashBuffer, overflow and host_spill are
+        shared int64 GPU scalars.  Returns (None, None, None) if no
+        GroupedExperts found.
     """
     from collections import defaultdict
 
-    from torchtitan.models.common.moe.moe import GroupedExperts
+    from torchtitan.models.common.moe import GroupedExperts
 
     device = getattr(ac_config, "paged_stash_buffer_device", "cuda")
     page_size = getattr(ac_config, "paged_stash_page_size", 64)
@@ -321,256 +513,172 @@ def create_paged_buffers(model, ac_config, *, max_tokens):
     for _fqn, mod in model.named_modules():
         if isinstance(mod, GroupedExperts):
             num_expert_modules += 1
-            # w1 shape: [num_experts, hidden_dim, dim]
-            # 4 dynamic activations have hidden_dim as last dim:
-            #   gmm1 out, silu out, gmm2 out, h = silu * gmm2
             ops_per_key[(mod.w1.dtype, mod.w1.shape[-2])] += 4
-            # 1 dynamic activation has dim as last dim: x.bf16()
             ops_per_key[(mod.w1.dtype, mod.w1.shape[-1])] += 1
 
     if not ops_per_key:
         logger.warning("No GroupedExperts found; no paged stash buffers created.")
-        return None, None
+        return None, None, None
 
-    # Create buffers sized to actual ops per key.
+    # When capacity_factor is provided, size to the balanced estimate
+    estimated_tokens = max_tokens
+    if capacity_factor is not None and capacity_factor > 0:
+        estimated_tokens = int(max_tokens / capacity_factor)
+
+    # Shared overflow and host_spill flags
     overflow = torch.zeros(1, dtype=torch.int64, device=device)
+    host_spill = torch.zeros(1, dtype=torch.int64, device=device)
     buffers = {}
     _rank0 = torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
     if _rank0:
-        logger.debug("create_paged_buffers: max_tokens=%d, buffer_size_factor=%.2f", max_tokens, buffer_size_factor)
-    for (dtype, hidden_size), num_ops in ops_per_key.items():
-        scaled_max = int(max_tokens * buffer_size_factor * num_ops)
-        buffers[dtype, hidden_size] = PagedStashBuffer(
-            scaled_max, hidden_size, page_size, device, overflow, dtype
+        logger.debug(
+            "create_paged_buffers: max_tokens=%d, estimated_tokens=%d, "
+            "capacity_factor=%s, buffer_size_factor=%.2f, "
+            "host_buffer_size_factor=%.2f",
+            max_tokens,
+            estimated_tokens,
+            capacity_factor,
+            buffer_size_factor,
+            host_buffer_size_factor,
         )
+    for (dtype, hidden_size), num_ops in ops_per_key.items():
+        scaled_cuda = int(estimated_tokens * buffer_size_factor * num_ops)
+        scaled_host = (
+            int(estimated_tokens * host_buffer_size_factor * num_ops)
+            if host_buffer_size_factor > 0
+            else 0
+        )
+        buffers[dtype, hidden_size] = PagedStashBuffer(
+            scaled_cuda,
+            hidden_size,
+            page_size,
+            device,
+            overflow,
+            host_spill,
+            dtype,
+            num_tokens_host=scaled_host,
+        )
+        buf = buffers[dtype, hidden_size]
+        msg = f"  key=({dtype}, {hidden_size}): cuda={buf.num_cuda_pages} pages"
+        if buf.host_buffer is not None:
+            msg += f", host={buf.num_host_pages} pages"
         if _rank0:
-            logger.debug("create_paged_buffers: key=(dtype=%s, hidden_size=%d), ops_per_key=%d, scaled_max_tokens=%d, num_pages=%d", dtype, hidden_size, num_ops, scaled_max, buffers[dtype, hidden_size].num_pages)
+            logger.debug(msg)
 
     logger.info(
         "Created %d paged stash buffers (max_tokens=%d, num_expert_modules=%d, "
-        "ops_per_key=%s, page_size=%d, device=%s)",
+        "ops_per_key=%s, page_size=%d, device=%s, host_buffer=%s)",
         len(buffers),
         max_tokens,
         num_expert_modules,
         dict(ops_per_key),
         page_size,
         device,
+        "yes" if host_buffer_size_factor > 0 else "no",
     )
 
-    return buffers, overflow
-
-
-# ---------------------------------------------------------------------------
-# PagedStashObserver: buffer sizing via observation
-# (mirrors Megatron's PagedStashManager capture-phase logic)
-# ---------------------------------------------------------------------------
-
-
-class PagedStashObserver:
-    """Observe actual token counts during the observation iteration for buffer sizing.
-
-    Mirrors Megatron's ``PagedStashManager`` capture-phase logic: tracks actual and
-    avg token counts per ``(dtype, hidden_size)`` key using increment (on_copy) /
-    decrement (on_pop) counters.  The high-water mark determines buffer allocation.
-
-    The ``status`` state machine mirrors Megatron's ``paged_stash_reset``:
-    - ``'begin'``: initial state, observation not yet started
-    - ``'capture'``: observation active, ``.item()`` calls record token counts
-    - ``'captured'``: observation complete, buffers allocated
-    """
-
-    def __init__(self):
-        self.status = "begin"
-
-        # Mirrors Megatron's temp_tokens_across_vp_stages (running count)
-        self.temp_tokens_across_vp_stages: dict[tuple, int] = {}
-        # Mirrors Megatron's max_tokens_across_vp_stages (high-water mark, actual)
-        self.max_tokens_across_vp_stages: dict[tuple, int] = {}
-        # Mirrors Megatron's temp_avg_tokens_across_vp_stages (running count, avg)
-        self.temp_avg_tokens_across_vp_stages: dict[tuple, int] = {}
-        # Mirrors Megatron's max_avg_tokens_across_vp_stages (high-water mark, avg)
-        self.max_avg_tokens_across_vp_stages: dict[tuple, int] = {}
-
-    def on_copy(
-        self,
-        hidden_size: int,
-        dtype: torch.dtype,
-        num_tokens_tensor: Tensor,
-        avg_num_tokens: int | None,
-    ) -> None:
-        """Called from ``paged_stash.copy``.  Mirrors Megatron's ``on_save_for_backward``."""
-        if self.status != "capture":
-            return
-        key = (dtype, hidden_size)
-        actual_num_tokens = num_tokens_tensor.to(torch.int64).item()
-
-        if key not in self.temp_tokens_across_vp_stages:
-            self.temp_tokens_across_vp_stages[key] = 0
-            self.max_tokens_across_vp_stages[key] = 0
-            self.temp_avg_tokens_across_vp_stages[key] = 0
-            self.max_avg_tokens_across_vp_stages[key] = 0
-
-        self.temp_tokens_across_vp_stages[key] += actual_num_tokens
-        self.max_tokens_across_vp_stages[key] = max(
-            self.max_tokens_across_vp_stages[key],
-            self.temp_tokens_across_vp_stages[key],
-        )
-
-        if avg_num_tokens is not None and avg_num_tokens > 0:
-            self.temp_avg_tokens_across_vp_stages[key] += avg_num_tokens
-            self.max_avg_tokens_across_vp_stages[key] = max(
-                self.max_avg_tokens_across_vp_stages[key],
-                self.temp_avg_tokens_across_vp_stages[key],
-            )
-
-    def on_pop(
-        self,
-        hidden_size: int,
-        dtype: torch.dtype,
-        num_tokens_tensor: Tensor,
-        avg_num_tokens: int | None,
-    ) -> None:
-        """Called from ``paged_stash.pop``.  Mirrors Megatron's ``on_get_saved_tensor``."""
-        if self.status != "capture":
-            return
-        key = (dtype, hidden_size)
-        actual_num_tokens = num_tokens_tensor.to(torch.int64).item()
-
-        if key in self.temp_tokens_across_vp_stages:
-            self.temp_tokens_across_vp_stages[key] -= actual_num_tokens
-        if (
-            avg_num_tokens is not None
-            and avg_num_tokens > 0
-            and key in self.temp_avg_tokens_across_vp_stages
-        ):
-            self.temp_avg_tokens_across_vp_stages[key] -= avg_num_tokens
-
-    def allocate_stash_buffers(
-        self,
-        buffers: list,
-        stash_buffer_size_factor_cuda: float,
-    ) -> None:
-        """Resize buffers from observed peak.  Mirrors Megatron's ``allocate_stash_buffers``.
-
-        Sign convention (mirrors Megatron):
-        - positive ``stash_buffer_size_factor_cuda``: use avg-based peak (default)
-        - negative: use actual-based peak (conservative)
-        """
-        cuda_factor = stash_buffer_size_factor_cuda
-
-        if cuda_factor >= 0:
-            max_tokens_dict = self.max_avg_tokens_across_vp_stages
-            cuda_scale = cuda_factor
-        else:
-            max_tokens_dict = self.max_tokens_across_vp_stages
-            cuda_scale = -cuda_factor
-
-        # Fallback: if avg dict empty, use actual
-        if not max_tokens_dict:
-            max_tokens_dict = self.max_tokens_across_vp_stages
-
-        for buf in buffers:
-            key = (buf.dtype, buf.hidden_size)
-            if key in max_tokens_dict:
-                num_tokens = int(max_tokens_dict[key] * cuda_scale)
-                buf.resize(num_tokens)
-
-    def paged_stash_reset(self) -> None:
-        """Transition state machine.  Mirrors Megatron's ``paged_stash_reset``."""
-        if self.status == "begin":
-            self.status = "capture"
-        elif self.status == "capture":
-            self.status = "captured"
-
-
-_observer = PagedStashObserver()
+    return buffers, overflow, host_spill
 
 
 def _block_size(hidden_size: int) -> int:
     """Compute the block size for Triton kernels, capped at hidden_size and rounded to power of 2."""
-    import triton
-
     return min(GLOBAL_BLOCK_SIZE, triton.next_power_of_2(hidden_size))
 
 
 # ---------------------------------------------------------------------------
-# paged_stash::copy — pack a tensor into the paged buffer
+# paged_stash::copy — pack a tensor into the paged buffer (CUDA or host)
 # ---------------------------------------------------------------------------
 
 
 @torch.library.custom_op(
     "paged_stash::copy",
-    mutates_args=("free_list_head", "overflow"),
+    mutates_args=(),
 )
 def paged_stash_copy(
     tensor: Tensor,
-    buffer: Tensor,
-    free_list: Tensor,
-    free_list_head: Tensor,
-    free_list_tail: Tensor,
-    free_list_capacity: Tensor,
-    overflow: Tensor,
     page_size: int,
     hidden_size: int,
     num_tokens_tensor: Tensor,
-    avg_num_tokens: int = 0,
+    buffer_id: int,
 ) -> tuple[Tensor, Tensor]:
     """Pack tensor into paged buffer using actual token count.
 
-    Args:
-        num_tokens_tensor: GPU scalar (int32/int64) with the actual number of
-            tokens to stash, from ``offsets[-1]`` (= ``tokens_per_expert.sum()``).
-            Only this many rows are copied; padding rows are skipped.
+    Looks up the ``PagedStashBuffer`` from the module-level registry by
+    ``buffer_id``.  Tries CUDA buffer first; falls back to pinned host if
+    CUDA pages exhausted; sets overflow flag if both exhausted.
+
+    The Triton kernel and free-list update run on a dedicated transfer
+    stream (from ao's ``_get_or_create_transfer_stream``), allowing
+    overlap with compute on the main stream.  A completion event is
+    registered in ao's ``_wait_registry`` keyed by the page_record's
+    ``data_ptr()``; the graph pass inserts ``ao.wait_tensor`` to
+    synchronize before the page_record is read in the backward pass.
 
     Returns (page_record, new_head).
-    page_record format: [num_tokens, page_id_0, ..., page_id_{N-1}]
-    where page_record is sized to the worst-case (tensor shape) for CUDA graph
-    static shapes, but only ceil(actual_tokens / page_size) page slots are used.
+    page_record format: [num_tokens, spilled_to_host, page_id_0, ..., page_id_{N-1}]
+    Sized to worst-case for CUDA graph static shapes.
     """
+    buf = _PAGED_STASH_REGISTRY[buffer_id]
+    has_host_buffer = 1 if buf.host_buffer is not None else 0
+    host_buffer = buf.host_buffer if buf.host_buffer is not None else buf.cuda_buffer
+
     flat = tensor.reshape(-1, hidden_size).contiguous()
-    max_num_tokens = flat.shape[0]  # oversized capacity (for page_record sizing + grid)
+    max_num_tokens = flat.shape[0]
     max_num_pages = (max_num_tokens + page_size - 1) // page_size
 
-    # page_record sized to worst-case for CUDA graph static shapes
-    page_record = torch.empty(
-        max_num_pages + 1, dtype=torch.int64, device=flat.device
+    # page_record: [num_tokens, spilled_to_host, page_ids...]
+    # Zero-initialized so that on overflow (copy kernel skips writing page IDs),
+    # the pop kernel reads page_id=0 — a valid page in the buffer.  The data is
+    # wrong but that's fine: overflow gradients are thrown away and the step is
+    # retried.
+    page_record = torch.zeros(
+        max_num_pages + 2, dtype=torch.int64, device=flat.device
     )
-    # Store actual token count in page_record[0] for pop to read
     num_tokens_i64 = num_tokens_tensor.reshape(1).to(torch.int64)
     page_record[0:1].copy_(num_tokens_i64)
-    page_ids = page_record[1:]  # view into page IDs portion
+    page_record[1:2].zero_()  # spilled_to_host = 0 (kernel may overwrite)
+    page_ids = page_record[2:]  # view into page IDs portion
 
-    new_free_list_head = free_list_head.clone()
+    new_free_list_head = torch.empty(2, dtype=torch.int64, device=flat.device)
 
-    # Grid sized to max for CUDA graph static launch config;
-    # kernel loop bounds on actual num_tokens via num_tokens_i64 pointer
+    # Switch to transfer stream for the Triton kernel + free-list update.
+    # Matches ao::offload pattern: transfer_stream.wait_stream(current),
+    # do work on transfer stream, record event, restore current stream.
+    device = tensor.device
+    current_stream = torch.accelerator.current_stream(device)
+    transfer_stream = _get_or_create_transfer_stream(device)
+    transfer_stream.wait_stream(current_stream)
+    torch.accelerator.set_stream(transfer_stream)
+
     num_blocks = max(min(max_num_tokens, 2048), 1)
     grid = (num_blocks,)
     _paged_stash_copy_kernel[grid](
         flat,
-        buffer,
+        buf.cuda_buffer,
+        host_buffer,
         num_tokens_i64,
-        free_list,
-        free_list_head,
-        free_list_tail,
-        free_list_capacity,
+        buf.free_list_cuda,
+        buf.free_list_host,
+        buf.free_list_head,
+        buf.free_list_tail,
+        buf.free_list_capacity,
         page_ids,
-        overflow,
+        buf.overflow,
+        buf.host_spill,
+        page_record[1:2],  # spilled_to_host_ptr
         new_free_list_head,
         PAGE_SIZE=page_size,
         HIDDEN_SIZE=hidden_size,
         BLOCK_SIZE=_block_size(hidden_size),
+        HAS_HOST_BUFFER=has_host_buffer,
     )
-    # Update the head pointer in-place
-    free_list_head.copy_(new_free_list_head)
+    # Update the head pointers in-place (on transfer stream, after kernel)
+    buf.free_list_head.copy_(new_free_list_head)
 
-    # Observation recording (mirrors Megatron's on_save_for_backward)
-    _observer.on_copy(
-        hidden_size,
-        tensor.dtype,
-        num_tokens_tensor,
-        avg_num_tokens if avg_num_tokens > 0 else None,
-    )
+    # Register completion event for ao::wait_tensor
+    completion_event = _register_wait(page_record, device)
+    transfer_stream.record_event(completion_event)
+    torch.accelerator.set_stream(current_stream)
 
     return page_record, new_free_list_head
 
@@ -578,23 +686,17 @@ def paged_stash_copy(
 @paged_stash_copy.register_fake
 def paged_stash_copy_fake(
     tensor: Tensor,
-    buffer: Tensor,
-    free_list: Tensor,
-    free_list_head: Tensor,
-    free_list_tail: Tensor,
-    free_list_capacity: Tensor,
-    overflow: Tensor,
     page_size: int,
     hidden_size: int,
     num_tokens_tensor: Tensor,
-    avg_num_tokens: int = 0,
+    buffer_id: int,
 ) -> tuple[Tensor, Tensor]:
     flat = tensor.reshape(-1, hidden_size)
-    # page_record sized to worst-case (tensor shape) for CUDA graph static shapes
     max_num_tokens = flat.shape[0]
     max_num_pages = (max_num_tokens + page_size - 1) // page_size
-    page_record = tensor.new_empty(max_num_pages + 1, dtype=torch.int64)
-    new_head = tensor.new_empty(1, dtype=torch.int64)
+    # page_record: max_num_pages + 2 (num_tokens + spilled_to_host + page_ids)
+    page_record = tensor.new_empty(max_num_pages + 2, dtype=torch.int64)
+    new_head = tensor.new_empty(2, dtype=torch.int64)
     return page_record, new_head
 
 
@@ -605,66 +707,80 @@ def paged_stash_copy_fake(
 
 @torch.library.custom_op(
     "paged_stash::pop",
-    mutates_args=("free_list_tail",),
+    mutates_args=(),
 )
 def paged_stash_pop(
     page_record: Tensor,
-    buffer: Tensor,
-    free_list: Tensor,
-    free_list_head: Tensor,
-    free_list_tail: Tensor,
-    free_list_capacity: Tensor,
     page_size: int,
     hidden_size: int,
     dtype: torch.dtype,
-    avg_num_tokens: int = 0,
+    buffer_id: int,
 ) -> Tensor:
     """Pop tensor from paged buffer. Returns reconstructed 2D tensor.
 
-    page_record format: [num_tokens, page_id_0, ..., page_id_{N-1}]
-    """
-    assert page_record.dtype == torch.int64, (
-        f"paged_stash.pop: expected page_record dtype=int64, got {page_record.dtype}"
-    )
-    # num_tokens is encoded in page_record[0], and num_pages = len(page_record) - 1
-    # Derive num_tokens from the page_record shape to avoid D2H sync during CUDA graph capture
-    num_pages = page_record.shape[0] - 1
-    num_tokens = num_pages * page_size  # upper bound; actual count is in page_record[0]
-    page_ids = page_record[1:]
+    Looks up the ``PagedStashBuffer`` from the module-level registry by
+    ``buffer_id``.  Reads ``spilled_to_host`` from the page_record to select
+    CUDA or host source buffer.
 
-    flat_out = torch.empty(
-        (num_tokens, hidden_size), dtype=dtype, device=buffer.device
+    The output tensor is allocated on the compute stream (matching
+    ao::reload's pattern for correct allocator ownership), then the
+    Triton kernel and free-list update run on the transfer stream.
+    A completion event is registered for ``ao.wait_tensor``.
+
+    page_record format: [num_tokens, spilled_to_host, page_id_0, ..., page_id_{N-1}]
+    """
+    buf = _PAGED_STASH_REGISTRY[buffer_id]
+    host_buffer = buf.host_buffer if buf.host_buffer is not None else buf.cuda_buffer
+
+    num_pages = page_record.shape[0] - 2
+    num_tokens = num_pages * page_size  # upper bound
+    page_ids = page_record[2:]
+
+    # Allocate output on compute stream (like ao::reload) so the
+    # allocator tracks ownership correctly.
+    device = buf.cuda_buffer.device
+    flat_out = torch.zeros(
+        (num_tokens, hidden_size), dtype=dtype, device=device
     )
-    # Use page_record[0:1] directly as the num_tokens tensor (already on GPU)
     num_tokens_tensor = page_record[0:1]
-    new_free_list_tail = free_list_tail.clone()
+    spilled_to_host = page_record[1:2]
+
+    new_free_list_tail = torch.empty(
+        2, dtype=torch.int64, device=device
+    )
+
+    # Switch to transfer stream for the Triton kernel + free-list update.
+    current_stream = torch.accelerator.current_stream(device)
+    transfer_stream = _get_or_create_transfer_stream(device)
+    completion_event = _register_wait(flat_out, device)
+    transfer_stream.wait_stream(current_stream)
+    torch.accelerator.set_stream(transfer_stream)
 
     num_blocks = max(min(num_tokens, 2048), 1)
     grid = (num_blocks,)
+
     _paged_stash_pop_kernel[grid](
-        buffer,
+        buf.cuda_buffer,
+        host_buffer,
         flat_out,
         num_tokens_tensor,
         page_ids,
-        free_list,
-        free_list_head,
-        free_list_tail,
-        free_list_capacity,
+        spilled_to_host,
+        buf.overflow,
+        buf.free_list_cuda,
+        buf.free_list_host,
+        buf.free_list_tail,
+        buf.free_list_capacity,
         new_free_list_tail,
         PAGE_SIZE=page_size,
         HIDDEN_SIZE=hidden_size,
         BLOCK_SIZE=_block_size(hidden_size),
     )
-    # Update the tail pointer in-place
-    free_list_tail.copy_(new_free_list_tail)
+    # Update the tail pointers in-place (on transfer stream, after kernel)
+    buf.free_list_tail.copy_(new_free_list_tail)
 
-    # Observation recording (mirrors Megatron's on_get_saved_tensor)
-    _observer.on_pop(
-        hidden_size,
-        dtype,
-        num_tokens_tensor,
-        avg_num_tokens if avg_num_tokens > 0 else None,
-    )
+    transfer_stream.record_event(completion_event)
+    torch.accelerator.set_stream(current_stream)
 
     return flat_out
 
@@ -672,18 +788,13 @@ def paged_stash_pop(
 @paged_stash_pop.register_fake
 def paged_stash_pop_fake(
     page_record: Tensor,
-    buffer: Tensor,
-    free_list: Tensor,
-    free_list_head: Tensor,
-    free_list_tail: Tensor,
-    free_list_capacity: Tensor,
     page_size: int,
     hidden_size: int,
     dtype: torch.dtype,
-    avg_num_tokens: int = 0,
+    buffer_id: int,
 ) -> Tensor:
     # num_tokens is data-dependent (stored in page_record[0]).
     # Use create_unbacked_symint for the dynamic first dimension.
     ctx = torch.library.get_ctx()
     num_tokens = ctx.create_unbacked_symint()
-    return buffer.new_empty((num_tokens, hidden_size), dtype=dtype)
+    return page_record.new_empty((num_tokens, hidden_size), dtype=dtype)

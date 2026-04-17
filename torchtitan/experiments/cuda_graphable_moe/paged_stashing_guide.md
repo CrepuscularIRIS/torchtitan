@@ -78,7 +78,7 @@ Head ------>                                               (allocate from head)
 
 Page management is handled by lightweight GPU kernels fused with the stash/restore operations. The Triton `_paged_stash_copy_kernel` allocates pages from the head and copies token data. The `_paged_stash_pop_kernel` copies back and returns pages to the tail. Both operate entirely on GPU -- no CPU involvement.
 
-A `page_record` tensor `[page_id_0, page_id_1, ...]` tracks which pages hold a given activation. This is the compact handle that crosses the fwd->bwd boundary instead of the full activation tensor.
+A `page_record` tensor `[num_tokens, spilled_to_host, page_id_0, page_id_1, ...]` tracks which pages hold a given activation. The first element encodes the actual token count, the second is a host-spill flag (0 = CUDA, 1 = host), and the remaining elements are page IDs. This is the compact handle that crosses the fwd->bwd boundary instead of the full activation tensor.
 
 ---
 
@@ -404,44 +404,56 @@ def _dispatch_setup_context(ctx, inputs, output):
 
 So the dispatch buffer is freed after expert compute uses it. The `_grouped_mm` outputs are what persist as saved tensors.
 
-### Step 5: Buffer Allocation — Initial Static + Runtime Resize
+### Step 5: Buffer Allocation — Capacity-Factor Sizing
 
-Buffers are initially allocated at worst-case size from model structure, then resized
-based on observed runtime usage during the CUDAGraph warmup iteration.
+Buffers are sized statically at model construction time using the routing capacity
+factor to estimate balanced token counts.
 
-**Initial allocation** (`create_paged_buffers`):
+**Allocation** (`create_paged_buffers` in `paged_stash_ops.py`):
 
 ```python
-# paged_stash_ops.py:create_paged_buffers
+# Scan model for GroupedExperts modules → ops_per_key[(dtype, hidden_size)]
 ops_per_key: dict[tuple[torch.dtype, int], int] = defaultdict(int)
 for _fqn, mod in model.named_modules():
     if isinstance(mod, GroupedExperts):
         ops_per_key[(mod.w1.dtype, mod.w1.shape[-2])] += 4  # gmm1, silu, gmm2, h
         ops_per_key[(mod.w1.dtype, mod.w1.shape[-1])] += 1  # x.bf16()
 
-scaled_max = int(max_tokens * buffer_size_factor * num_ops)
+# Estimate balanced tokens from capacity factor
+estimated_tokens = int(max_tokens / capacity_factor) if capacity_factor else max_tokens
+scaled_cuda = int(estimated_tokens * buffer_size_factor * num_ops)
+scaled_host = int(estimated_tokens * host_buffer_size_factor * num_ops) if host_buffer_size_factor > 0 else 0
 ```
 
-**Runtime resize** (mirrors Megatron's `allocate_stash_buffers`):
+**Buffer sizing parameters** (in `PagedStashActivationCheckpointConfig`):
 
-During CUDAGraph warmup (step 1), the `PagedStashObserver` (status='capture') records
-actual and avg token counts via `on_copy`/`on_pop` calls in the `paged_stash.copy` and
-`paged_stash.pop` custom op bodies. These mirror Megatron's `on_save_for_backward` /
-`on_get_saved_tensor` increment/decrement counters.
+| Parameter | Default | Purpose |
+|---|---|---|
+| `paged_stash_buffer_size_factor` | 1.1 | CUDA buffer over-provisioning multiplier on `estimated_tokens` |
+| `paged_stash_host_buffer_size_factor` | 0.0 | Host pinned buffer multiplier (0 = no host buffer) |
+| `paged_stash_page_size` | 64 | Tokens per page |
 
-After step 1, `allocate_stash_buffers` uses the observed
-`max_tokens_across_vp_stages` / `max_avg_tokens_across_vp_stages` to resize buffers
-via `buf.resize()`. The resize calls `register_buffer()` on the fwd/bwd GraphModules,
-propagating new tensor pointers before CUDAGraph capture on step 2.
+**3-level overflow defense** (mirrors Megatron):
 
-Sign convention (mirrors Megatron): positive `stash_buffer_size_factor` uses avg-based
-peak (default); negative uses actual-based peak (conservative).
+1. **Host spillover** (Level 1): When CUDA pages exhausted, the Triton copy kernel
+   falls back to a pinned host buffer. The pop kernel reads `page_record[1]`
+   (`spilled_to_host` flag) to select the source. Warning only, no retry needed.
 
-```
-Step 1: compile + warmup (eager) → observer records token counts → resize buffers
-Step 2: CUDAGraph capture (right-sized buffers — register_buffer propagated)
-Step 3+: CUDAGraph replay
-```
+2. **Cross-rank detection** (Level 2): After each step, `all_reduce(SUM)` of 3 flags
+   (stash overflow, HybridEP over-budget, host spill) ensures all ranks agree.
+   Implemented in `overflow.py:check_overflow_all_ranks`.
+
+3. **Retry** (Level 3): On full overflow (both CUDA and host exhausted) or
+   over-budget: zero grads, grow buffers (2x via `PagedStashBuffer.grow()`),
+   reset CUDA graphs (`_cg_manager.reset_all()`), rerun fwd/bwd. Max 2 attempts.
+
+**Buffer access at runtime**: Via `_PAGED_STASH_REGISTRY[buffer_id]` inside the
+custom op implementations. The `buffer_id` is baked as an integer constant in the
+compiled graph. No buffer tensors cross the graph boundary.
+
+**page_record format**: `[num_tokens, spilled_to_host, page_id_0, page_id_1, ...]`
+This encodes both the actual token count and the host-spill flag, allowing both to
+travel through the fwd→bwd boundary without extra saved tensors.
 
 ### Step 6: CUDA Graph Captures at Oversized Shapes
 
@@ -463,8 +475,9 @@ During replay, `copy_non_static_inputs` copies new token data into the static (o
 ```
 parallelize_deepseekv3():
     graph_trainer_parallelize(model, compile=False)    # TP, EP (HybridEP), FSDP
-    create_paged_buffers(model, ac_config, max_tokens)
+    create_paged_buffers(model, ac_config, max_tokens, capacity_factor, host_factor)
     model._paged_stash_buffers = buffers
+    register_paged_stash_buffer(buf)   # → _PAGED_STASH_REGISTRY[buffer_id] = buf
     partition_fn = make_paged_stash_partition_fn(buffers)
     _apply_paged_stash_compile(model, ..., partition_fn)
 
@@ -479,23 +492,21 @@ At compile time (first forward):
         min_cut_rematerialization_partition -> separate fwd/bwd graphs
         enable_paged_stash:
             choose_paged_stash_sets: identify saved tensors (annotation OR SymInt + buffer key)
-            stash_chosen_sets: insert paged_stash.copy in fwd, paged_stash.pop in bwd
+            stash_chosen_sets: insert paged_stash.copy/pop with buffer_id constants
     cudagraph_pass: wrap fwd/bwd with CUDAGraphWrapper
 
 At runtime:
-    Step 1 (observation + warmup):
-        PagedStashObserver.paged_stash_reset() → status='capture'
-        Reset buffer free lists + overflow flag
-        CUDAGraphWrapper warmup (eager) — stash ops run, observer records
-        PagedStashObserver.paged_stash_reset() → status='captured'
-        allocate_stash_buffers() → resize from observed peak
+    Step 1 (warmup):
+        Reset buffer free lists + overflow/host_spill flags
+        CUDAGraphWrapper warmup (eager — stash ops run via _PAGED_STASH_REGISTRY lookup)
     Step 2 (CUDAGraph capture):
-        Reset buffers (right-sized)
-        CUDAGraphWrapper capture (with right-sized buffer addresses)
+        Reset buffers
+        CUDAGraphWrapper capture
     Step 3+ (replay):
         Reset buffers
         CUDAGraph replay
-        Check overflow
+        Check overflow/overbudget/host_spill via all_reduce
+        On overflow: zero grads, grow buffers, reset graphs, retry
 ```
 
 ### Accounting: Where Ideas Map Between Implementations
@@ -652,8 +663,7 @@ saved tensor output with the compact `page_record`:
 with fwd_module.graph.inserting_before(fwd_output):
     copy_node = fwd_module.graph.call_function(
         torch.ops.paged_stash.copy,
-        args=(fwd_node, buf_node, fl_node, flh_node, flt_node, flc_node,
-              ovf_node, page_size, hidden_size),
+        args=(fwd_node, page_size, hidden_size, actual_num_tokens, buffer_id),
     )
     page_record_node = fwd_module.graph.call_function(
         operator.getitem, args=(copy_node, 0),
@@ -661,6 +671,13 @@ with fwd_module.graph.inserting_before(fwd_output):
 # Replace in fwd output:
 fwd_outs_list[num_fwd_outputs + saved_idx] = page_record_node
 ```
+
+Buffer tensors are accessed through a **module-level registry**
+(`_PAGED_STASH_REGISTRY` in `paged_stash_ops.py`) at runtime, not through graph
+arguments. The graph only carries a `buffer_id` integer constant per op — no buffer
+tensors as `get_attr` nodes, placeholders, or saved tensors. This follows the
+`ao::offload` pattern (which uses module-level `_transfer_streams` and
+`_wait_registry` dicts).
 
 The key difference: offloading replaces a GPU tensor with a CPU tensor (same data,
 different device). Paged stash replaces a GPU tensor with a compact `page_record`
@@ -686,18 +703,18 @@ with graph.inserting_before(first_user):
 node.replace_all_uses_with(gpu_node)
 ```
 
-Paged stash inserts `paged_stash.pop` after the corresponding placeholder, then replaces
+Paged stash inserts `paged_stash.pop` after the last bwd placeholder, then replaces
 all uses:
 ```python
 # paged_stash_graph_pass.py (stash_chosen_sets)
-with bwd_module.graph.inserting_after(flc_node):
+with bwd_module.graph.inserting_after(insert_after_node):
     pop_node = bwd_module.graph.call_function(
         torch.ops.paged_stash.pop,
-        args=(ph, buf_node, fl_node, flh_node, flt_node, flc_node,
-              page_size, hidden_size, val.dtype),
+        args=(ph, page_size, hidden_size, val.dtype, buffer_id),
     )
 ph.replace_all_uses_with(restore_node)
 pop_node.args = (ph, *pop_node.args[1:])  # fix self-reference
+insert_after_node = restore_node           # advance insertion point
 ```
 
 ### Summary of Parallels
@@ -728,32 +745,68 @@ oversized budget), it is wrapped in a `PagedTensor` and queued for stashing. The
 configures `stash_modules` to select which submodules (`expert_fc1`, `moe_act`,
 `expert_fc2`) are wrapped.
 
-**torchtitan**: Two-phase selection:
+**torchtitan**: Joint-graph pass selection (follows PR #2879's ``cpu_offload_pass``
+architecture). A single ``apply_paged_stash_pass`` operates on the joint fwd+bwd
+graph before min-cut partitioning:
 
-1. **Pre-partition** (`_apply_paged_stash_must_save` in `partition_fn`): Uses
-   `classify_nodes` backward-usage analysis. For each annotated node:
-   - If dynamically shaped (SymInt) AND has real backward tensor usages → `MUST_SAVE`
-   - If statically shaped → leave SAC's decision (MUST_SAVE for expensive ops like
-     `_grouped_mm`, PREFER_RECOMPUTE for cheap ops like `silu`/`mul`)
-   - If no backward usages or only sym-node usages → skip
+1. **Fwd/bwd classification**: Uses ``seq_nr`` metadata — first occurrence of each
+   ``seq_nr`` is forward, subsequent occurrences are backward.
 
-2. **Post-partition** (`can_paged_stash`): For each saved tensor crossing the fwd/bwd
-   boundary:
-   - Must have the `paged_stash` annotation OR any dynamic SymInt dimension
-   - Must be a dynamic activation (any SymInt dim) or 2D (fallback for concrete shapes)
-   - Must match a buffer key `(dtype, shape[-1])`
+2. **Eligibility check** (``_is_paged_stash_eligible``): A forward node is eligible when:
+   - It carries the ``paged_stash`` annotation (from ``annotate_fn``)
+   - It has real (non-sym) backward consumers
+   - It has a dynamic SymInt first dimension (static weights excluded)
+   - Its ``(dtype, shape[-1])`` matches a pre-allocated paged buffer key
+
+3. **Graph surgery**: For each eligible node, inserts ``paged_stash.copy`` +
+   ``ao.wait_tensor`` in the forward region and ``paged_stash.pop`` +
+   ``ao.wait_tensor`` in the backward region. Backward consumers are redirected
+   via ``replace_input_with`` to read from the pop output.
+
+4. **Min-cut integration**: After surgery, the large activation has no backward
+   users (they were all redirected). Min-cut sees only the compact ``page_record``
+   (int64 handle) crossing the fwd→bwd boundary. The large activation is freed
+   after forward.
 
 **Key design parallel**: Both implementations define a "region" containing the expert
 computation, then stash activation tensors from that region:
-- Megatron: region = `with offload_context:` block; shape check = `size(0) == max_tokens`
-- torchtitan: region = `annotate_fn({"paged_stash": True})`; shape check =
-  SymInt dim (dynamic) or 2D + buffer key (concrete shapes fallback)
+- Megatron: region = `with offload_context:` block; gate = `hasattr(tensor, 'grouped_tensor_scale_inv')` (fp8-only)
+- torchtitan: region = `annotate_fn({"paged_stash": True})`; gate = SymInt dynamic dim + buffer key match (works with any dtype)
 
 **False positive prevention**: 3D weight transposes (e.g., `w1.bf16().T` with shape
 `[num_experts, dim, hidden_dim]`) are inside the annotated region and their last
-dimension can match a buffer key. With SymInt enabled, they are excluded because
-all their dimensions are concrete (weights have static shapes). With concrete shapes,
-the 2D fallback check (`len(shape) == 2`) excludes them.
+dimension can match a buffer key. They are excluded because the eligibility check
+requires a dynamic SymInt first dimension — weights have static shapes.
+
+**Why SymInt is correct for statically-shaped tensors**: HybridEP in non-blocking
+mode outputs tensors with a **fixed runtime shape** — padded to the capacity-factor
+budget via ``_num_permuted_tokens_for_non_blocking(num_tokens, ep_size,
+num_local_experts, top_k, cf)``.  For example, with ``cf=1.0`` on the debugmodel,
+every dispatch produces a ``[65536, hidden_dim]`` tensor regardless of the actual
+routing.  The allocation size never changes across steps.
+
+However, only ``tokens_per_expert.sum()`` rows contain valid data — the rest is
+padding.  This count varies per-step as the router learns.  The tensors are
+**statically allocated but semantically dynamic**: the meaningful content within the
+fixed-size buffer changes every step.
+
+``_dispatch_fake`` uses ``ctx.new_dynamic_size()`` to mark the token dimension as a
+``SymInt``.  This is truthful — it tells the compiler that:
+
+1. The **meaningful data length** varies (the compiler should not assume all elements
+   are live).
+2. Downstream ops (``paged_stash.copy``) should use ``num_tokens_tensor`` (the actual
+   token count) rather than the padded shape — copying only real tokens, not the full
+   buffer.
+3. The graph pass can distinguish activations (SymInt dim, variable content) from
+   weights (concrete dims, fixed content) within the same annotated region.
+
+This design is complementary to the static buffer sizing strategy.  Buffer sizing
+uses the capacity-factor formula to pre-allocate a fixed-size paged buffer (matching
+Megatron's default positive-factor approach).  SymInt identification tells the graph
+pass *which* tensors to page-stash and enables the ``num_tokens`` optimization that
+copies only live data.  The two are independent concerns — one is about memory
+allocation, the other is about tensor identification in the graph.
 
 ### 2. Actual Token Count: How `num_tokens` Propagates
 
@@ -791,28 +844,47 @@ catches additional derived tensors, the fallback may engage.
 
 ### 3. Buffer Sizing Strategy
 
-**Megatron**: Runtime capture — the first iteration (`'capture'` phase) profiles actual
-token counts across all layers and VP stages using `saved_tensors_hooks` with
-increment/decrement counters (`temp/max_tokens_across_vp_stages` and
-`temp/max_avg_tokens_across_vp_stages`). Buffers are allocated based on observed peak.
-Two strategies controlled by `stash_buffer_size_factor_cuda`:
-- Positive (default 1.10): sizes to `avg_num_tokens` peak × factor. Memory-efficient but
-  risks overflow if actual counts exceed the average-based estimate.
-- Negative: sizes to `actual_max_tokens` peak × abs(factor). Conservative.
+**Megatron**: Capacity-factor-based sizing with a runtime observation phase. The
+default approach (positive ``stash_buffer_size_factor_cuda``, default 1.10) sizes
+buffers using ``avg_num_tokens = max_num_tokens // capacity_factor`` — the same
+balanced estimate as torchtitan. The runtime observation (capture iteration) collects
+per-layer per-VP-stage ``max_num_tokens`` values from the actual HybridEP dispatch,
+then derives ``avg_num_tokens`` by dividing by the capacity factor. This makes the
+estimate per-layer-specific rather than a single global number.
 
-**torchtitan**: Runtime observation via `PagedStashObserver` — mirrors Megatron's approach.
-Initial buffers are allocated at worst-case from model structure (`create_paged_buffers`).
-During CUDAGraph warmup (step 1), `PagedStashObserver` (status='capture') records
-actual and avg token counts via `on_copy`/`on_pop` calls in the `paged_stash.copy`/`pop`
-custom op bodies. After warmup, `allocate_stash_buffers` resizes buffers from observed
-peak using the same sign convention as Megatron.
+Two strategies controlled by the sign of ``stash_buffer_size_factor_cuda``:
+- Positive (default 1.10): sizes to ``avg_num_tokens`` peak × factor. This is
+  effectively the same capacity-factor formula as torchtitan's static approach,
+  but computed per-layer from observed dispatch sizes.
+- Negative (legacy): sizes to ``actual_max_tokens`` peak × abs(factor). Conservative,
+  uses the full padded buffer size.
 
-The observation mechanism differs from Megatron: Megatron uses `saved_tensors_hooks` at
-the autograd level; torchtitan uses recording calls inside the compiled paged stash custom
-ops. Both produce the same per-key peak concurrent usage data.
+The capture iteration is a one-time overhead (the first training iteration runs
+without stashing to collect sizing data; buffers are allocated before the second
+iteration).
 
-For the debugmodel: initial 42,240 pages → resized to 33,792 pages. Steady-state memory
-dropped from 5.75 GiB to 5.52 GiB (230 MiB saved).
+**torchtitan**: Static capacity-factor sizing — buffers are pre-allocated at model
+construction time using the same balanced-estimate formula:
+
+```python
+estimated_tokens = int(max_tokens / capacity_factor)
+scaled_cuda = int(estimated_tokens * buffer_size_factor * num_ops)
+scaled_host = int(estimated_tokens * host_buffer_size_factor * num_ops)
+```
+
+Where ``max_tokens`` is the worst-case padded count from HybridEP,
+``capacity_factor`` converts to the balanced estimate, ``buffer_size_factor``
+(default 1.1) over-provisions by 10%, and ``host_buffer_size_factor`` (default 0.0)
+optionally allocates a pinned host spillover buffer. The formula is equivalent to
+Megatron's default positive-factor approach but uses a single global ``max_tokens``
+rather than per-layer observed values.
+
+**Assessment**: Both implementations default to the same capacity-factor-based
+sizing formula. Megatron's per-layer observation is slightly more precise for
+models where different layers see different token counts (e.g., with pipeline
+parallelism). torchtitan uses a single global estimate which is simpler and avoids
+the one-iteration profiling overhead. Both rely on the 3-level overflow defense to
+handle cases where the estimate is insufficient.
 
 ### 4. Oversized Buffer Memory Lifecycle
 
@@ -828,19 +900,21 @@ dropped from 5.75 GiB to 5.52 GiB (230 MiB saved).
 The oversized buffer from layer N is freed at the start of layer N+1, after the async
 copy completes. This is carefully timed memory recycling.
 
-**torchtitan**: Implicit via CUDA graph memory pool:
+**torchtitan**: Implicit via joint-graph pass + CUDA graph memory pool:
 
-1. The FX graph represents the full computation statically.
-2. `paged_stash.copy` is inserted before the fwd output node — it copies data to
-   the paged buffer and produces a compact `page_record`.
-3. The original oversized tensor's lifetime is determined by the CUDA graph's internal
-   memory pool. When all consumers of an oversized tensor (the copy op and the combine
-   op) finish within the graph, the CUDA graph pool recycles that memory for subsequent
-   operations. This means the next layer's dispatch can reuse the same memory addresses
-   as the previous layer's freed oversized buffers — no explicit lifecycle management
-   needed.
-4. During CUDA graph replay, the same allocation/deallocation pattern is replayed
-   from the captured graph. The pool recycling is deterministic and matches capture.
+1. The joint-graph pass inserts ``paged_stash.copy`` + ``ao.wait_tensor`` right
+   after each eligible forward activation. The ``keepalive`` parameter on
+   ``ao.wait_tensor(page_record, fwd_node)`` creates a graph edge that keeps the
+   activation alive until the compute stream synchronizes — but does NOT create
+   a backward dependency.
+2. After surgery, the activation has **no backward users** (they were all redirected
+   to ``paged_stash.pop`` output). Min-cut does not save it across the fwd/bwd
+   boundary. The activation is freed once its forward-region consumers complete.
+3. During CUDA graph replay, the pool recycles the freed activation memory for
+   subsequent operations — no explicit lifecycle management needed.
+4. Empirically verified: peak memory 2.96 GiB with paged stash vs 1.68 GiB baseline
+   on the debugmodel (paged buffer overhead exceeds savings at small scale; expected
+   to show net savings on larger models where activation fragmentation dominates).
 
 **Assessment**: torchtitan's approach is **simpler and more correct by construction** —
 the compiler handles lifetimes automatically. The trade-off is that CUDA graph capture
@@ -859,54 +933,47 @@ to the CUDA graph approach, not specific to paged stash.
 - Schedule-driven prefetch (`reload_paged_tensors` called from
   `PP_PostScheduleFunction.backward`) starts loading tensors before they are needed.
 
-**torchtitan**: Async stream overlap via `torch.ops.streams.*` FX graph ops (updated
-2026-03-24). Follows the same pattern as PyTorch's `enable_activation_offloading`
-(`torch/_functorch/_activation_offloading/activation_offloading.py`):
+**torchtitan**: Imperative stream management inside custom ops, following the
+``ao::offload/reload/wait_tensor`` pattern from
+``torch/_functorch/_activation_offloading/offload_ops.py``:
 
-- **Forward**: Each `paged_stash.copy` is wrapped with stream fork/join/event ops:
-  ```
-  record_event(ready_event, default_stream)     # data ready
-  fork(default_stream, copy_stream)              # switch to copy stream
-  wait_event(ready_event, copy_stream)           # wait for data
-  record_stream(tensor, copy_stream)             # prevent premature free
-  --- paged_stash.copy ---                       # Triton copy on copy_stream
-  record_event(done_event, copy_stream)          # mark done
-  join(copy_stream, default_stream)              # switch back
-  wait_event(done_event, default_stream)         # sunk to end of fwd graph
-  ```
-  The `wait_event` for copy completion is sunk to the end of the forward graph
-  (`_sink_forward_copy_wait`), allowing the next layer's compute to overlap with
-  the async copy — mirroring `activation_offload_sink_wait`.
+- **Stream infrastructure**: Reuses ao's ``_get_or_create_transfer_stream`` (one
+  dedicated stream per device) and ``_wait_registry`` (data_ptr → completion event
+  mapping). No separate paged-stash stream infrastructure needed.
 
-- **Backward**: Each `paged_stash.pop` is wrapped with stream ops:
-  ```
-  fork(default_stream, pop_stream)               # switch to pop stream
-  wait_stream(pop_stream, default_stream)        # wait for dependencies
-  --- paged_stash.pop ---                        # Triton pop on pop_stream
-  record_event(done_event, pop_stream)           # mark done
-  join(pop_stream, default_stream)               # switch back
-  wait_event(done_event, default_stream)         # wait for pop done
-  ```
-  The pop group can be prefetched earlier in the graph (moving fork → wait_stream →
-  pop → record_event → join before earlier compute nodes while keeping wait_event at
-  the original position) — mirroring `activation_reload_prefetch`.
+- **Inside ``paged_stash::copy``**: Switches to the transfer stream via
+  ``torch.accelerator.set_stream``, launches the Triton scatter kernel, updates
+  ``free_list_head``, records a completion event, then restores the compute stream.
+  This matches ``ao::offload``'s pattern exactly.
 
-- **CUDA graph compatible**: The `torch.ops.streams.*` ops are captured into the CUDA
-  graph during capture. The multi-stream execution pattern is replayed on every graph
-  replay.
+- **Inside ``paged_stash::pop``**: Allocates the output tensor on the compute stream
+  (matching ``ao::reload``'s allocator-ownership pattern), then switches to the
+  transfer stream for the Triton gather kernel and ``free_list_tail`` update.
 
-- **Configuration**: `paged_stash_separate_stream=true` in
-  `PagedStashActivationCheckpointConfig`.
+- **Graph synchronization**: ``ao.wait_tensor`` nodes in the FX graph synchronize
+  the compute stream when the page_record or pop output is needed. The ``keepalive``
+  parameter on forward wait nodes extends the original activation's lifetime past the
+  async Triton copy.
+
+- **CUDA graph compatible**: The ``torch.accelerator.set_stream`` calls inside the
+  ops are captured into the CUDA graph. On replay, the CUDA runtime replays kernels
+  on their respective streams. Empirically verified: Triton copy/pop kernels appear
+  on streams 755/999, compute kernels on stream 7.
+
+- **Scheduling**: Currently, ``ao.wait_tensor`` is placed immediately after each
+  ``paged_stash.copy/pop``, so the compute stream blocks right away — no overlap
+  within a step. This matches PR #2879's ``cpu_offload_pass`` which has the same
+  TODO. A future scheduling pass could sink forward waits to achieve overlap.
 
 **Comparison**:
 
 | Aspect | Megatron | torchtitan |
 |---|---|---|
-| Stream mechanism | Explicit Python `torch.cuda.Stream()` + stream sync | `torch.ops.streams.*` FX graph ops |
-| Overlap point (fwd) | copy overlaps with next layer's compute | Same (wait_event sunk to end of fwd graph) |
-| Overlap point (bwd) | prefetch pop before needed | Same pattern available (pop group moveable) |
-| CUDA graph compat | Runs outside CUDA graph (eager) | Captured into CUDA graph |
-| Overhead | Python-level stream management per step | Zero runtime overhead (baked into graph) |
+| Stream mechanism | Explicit ``torch.cuda.Stream()`` + ``wait_stream`` | ao's ``_get_or_create_transfer_stream`` + ``set_stream`` inside ops |
+| Synchronization | ``current_stream.wait_stream(pack_stream)`` | ``ao.wait_tensor`` graph nodes (``current_stream.wait_event``) |
+| Overlap achieved | Copy overlaps with next layer's compute | Not yet (scheduling TODO, same as PR #2879) |
+| CUDA graph compat | Runs outside CUDA graph (eager only) | Captured into CUDA graph (multi-stream replay verified) |
+| Stream safety | Comment: "not yet stream-safe" (same stream) | Correct by construction (separate transfer stream) |
 
 ### 6. Pipeline Parallelism Support
 
@@ -935,6 +1002,16 @@ Key details:
 - `'columnwise_scale_inv'` in `grouped_name` triggers scale-specific handling:
   `hidden_size = numel / (max_num_tokens / SCALE_INV_BLOCK_SIZE=32)`
 - Separate buffer keys: `(uint8, K)` for qdata, `(uint8, K//32)` for scale
+
+**Critical gate**: Megatron's ``on_save_for_backward`` checks
+``hasattr(tensor, 'grouped_tensor_scale_inv')`` (``paged_stash.py:883``). If this
+attribute is absent, the tensor is returned as ``tensor.detach()`` — **paged stash
+does not activate**. Only fp8 tensors from TransformerEngine's fused GroupedMLP
+with MXFP8 carry this attribute. Empirically verified: running
+``pretrain_gpt.py`` with ``--fp8-format hybrid`` (not MXFP8) produces
+``max_tokens_dict is None, skipping stash buffer allocation`` — paged stash never
+activates. The Megatron unit test uses ``fp8='e4m3', fp8_recipe='mxfp8'`` and
+correctly activates paged stash.
 
 **torchtitan**: MXFP8 works out of the box — **no FP8-specific changes needed**.
 
@@ -973,18 +1050,37 @@ in the FX graph because torchao's `_MXFP8GroupedMM` is an opaque autograd Functi
 
 ### 8. Overflow Detection and Handling
 
-**Megatron**: Overflow is detected in the Triton copy kernel
-(`avail_pages < required_pages`). Checked at:
-1. Iteration start (`paged_stash_reset`) — assertion if previous iteration overflowed.
-2. After CUDA graph replay (`check_paged_stash_overflow`) — since graph replay cannot
-   raise mid-execution.
+**Megatron**: 3-level overflow defense:
+1. Host spillover: when CUDA pages exhausted, Triton copy kernel spills to pinned host.
+2. Cross-rank detection: `all_reduce` of overflow + over-budget flags.
+3. Retry: re-run fwd/bwd without capacity padding and without paged stash.
 
-**torchtitan**: Same overflow detection in the Triton kernel. Checked after each training
-step in `PagedStashTrainer.train_step()` using `overflow.item()`.
+**torchtitan**: Same 3-level defense (mirrors Megatron), implemented in
+`PagedStashTrainer.train_step` and `overflow.py`:
 
-**Assessment**: Functionally equivalent. Both check overflow after the step completes and
-raise `RuntimeError`. The `overflow.item()` D2H sync is fine because it runs after the
-full forward+backward, not during CUDA graph capture.
+1. **Host spillover** (Level 1): Triton `_paged_stash_copy_kernel` checks CUDA free
+   list first; if exhausted, falls back to host buffer (if configured). Sets
+   `page_record[1] = 1` (spill flag) and `host_spill_global_ptr = 1`. The pop kernel
+   reads the spill flag to select CUDA vs host source.
+
+2. **Cross-rank detection** (Level 2): After each fwd/bwd, `check_overflow_all_ranks`
+   packs 3 flags (stash overflow, HybridEP overbudget from `check_hybridep_over_budget`,
+   host spill) into a single `all_reduce(SUM)` so all ranks agree.
+
+3. **Retry** (Level 3): On overflow or overbudget, `_prepare_for_retry` zeros grads,
+   optionally grows CUDA buffers (2x via `PagedStashBuffer.grow()`), resets CUDA graphs
+   (`_cg_manager.reset_all()` → `CUDAGraphWrapper.reset()` for re-capture), and reruns
+   fwd/bwd. Max `1 + max_retries` attempts. Optimizer step only after success.
+
+**Configuration** (in `PagedStashActivationCheckpointConfig`):
+- `paged_stash_overflow_detection: bool = True` — enable per-step checking
+- `paged_stash_max_retries: int = 1` — max retry attempts
+- `paged_stash_grow_on_overflow: bool = True` — grow CUDA buffers before retry
+- `paged_stash_host_buffer_size_factor: float = 0.0` — host buffer sizing (0 = off)
+
+**Assessment**: Functionally equivalent to Megatron's 3-level defense. The main
+difference: Megatron retries without capacity padding (falling back to exact-size
+dispatch), while torchtitan retries with grown buffers (keeping capacity padding).
 
 ### 9. Stash/Restore Data Correctness
 
@@ -1011,22 +1107,26 @@ full forward+backward, not during CUDA graph capture.
 `max_num_tokens` in torchtitan (up to `page_size - 1` extra rows due to page alignment),
 but the `_grouped_mm` backward only reads valid rows. No correctness issue.
 
-### 10. Process Cleanup / NCCL Reference Management
+### 10. Process Cleanup / Buffer Registry Management
 
 **Megatron**: `PagedStashManager` is a singleton with natural eager lifecycle. Buffer
 deallocation happens when the manager is destroyed. CUDA graph cleanup is handled by
 Megatron's `FullCudaGraphWrapper`.
 
-**torchtitan**: Required a fix — `PagedStashBuffer._registered_modules` held strong
-Python references to the fwd/bwd `GraphModule` objects (created by
-`_register_buffer_attrs` in the graph pass). These kept `CUDAGraphWrapper` →
-`torch.cuda.CUDAGraph` → NCCL communicator handles alive, preventing
-`destroy_process_group()` from completing. Fixed by clearing `_registered_modules` in
-`PagedStashTrainer.close()`.
+**torchtitan**: Uses a module-level buffer registry (`_PAGED_STASH_REGISTRY` in
+`paged_stash_ops.py`). `PagedStashTrainer.close()` calls
+`unregister_paged_stash_buffer(id(buf))` to remove entries before
+`GraphTrainer.close()` tears down the graph modules and CUDA graphs.
 
-**Assessment**: This was a torchtitan-specific bug arising from the FX graph approach —
-registering buffer attributes on graph modules creates backreferences that the eager
-approach does not have. Now fixed.
+This replaced an earlier design where `PagedStashBuffer._registered_modules` held
+strong references to fwd/bwd `GraphModule` objects (via `register_buffer` +
+`get_attr` nodes). Those references kept `CUDAGraphWrapper` → NCCL communicator
+handles alive, blocking `destroy_process_group()`. The module-level registry avoids
+this because buffer tensors are never part of the graph — only integer `buffer_id`
+constants are baked in.
+
+**Assessment**: The module-level registry pattern (from `ao::offload`) is simpler and
+avoids the reference-cycle issues of the earlier `register_buffer` approach.
 
 ### Summary Table
 
@@ -1035,14 +1135,15 @@ approach does not have. Now fixed.
 | **Tensor selection** | Runtime heuristic (`size(0) == max_tokens`) | Region annotation + SymInt backward-usage analysis + buffer key | SymInt-aware; composes with SAC |
 | **Stash interception** | `saved_tensors_hooks` at runtime | Pre-partition: `_apply_paged_stash_must_save` (selective MUST_SAVE); post-partition: `can_paged_stash` + `stash_chosen_sets` (graph surgery) | Different paradigms, equivalent result |
 | **num_tokens source** | `tokens_per_expert.sum()` (eager) | `cumsum(tokens_per_expert)[-1]` (FX graph) | Equivalent |
-| **Buffer sizing** | Runtime observed peak + headroom | Runtime observed peak + headroom (via PagedStashObserver) | Both runtime-adaptive now |
+| **Buffer sizing** | Runtime observed peak + headroom | Capacity-factor estimate + `buffer_size_factor` over-provisioning; optional host spillover buffer | Both pre-size based on routing expectations |
 | **Oversized buffer lifecycle** | Explicit `_original_tensor` management | Implicit via AOT graph lifetimes | Simpler in torchtitan |
 | **Async stream overlap** | `pack_stream` / `unpack_stream` | `torch.ops.streams.*` FX graph ops (fork/join/event) captured into CUDA graph | Both support async overlap |
 | **PP support** | Schedule-driven prefetch + runtime capture | Not supported; will follow Megatron closely when added |
 | **FP8 support** | `MXFP8Tensor` handling in `PagedTensor` (stashes FP8 data + scale) | Works out of the box — stashes bf16 activations (MXFP8 quantization transparent to stash) | Different approach: Megatron saves FP8, torchtitan saves bf16 |
-| **Overflow handling** | Triton check + host assertion | Same | Equivalent |
+| **Overflow handling** | 3-level: host spillover → cross-rank all_reduce → retry without padding | 3-level: host spillover → cross-rank all_reduce → retry with buffer grow + graph reset | Equivalent defense levels |
 | **Stash/restore correctness** | Truncate/pad around actual tokens | Copy actual tokens, page-aligned restore | Correct |
-| **NCCL cleanup** | Natural eager lifecycle | Required explicit `close()` fix | Fixed |
+| **Buffer access** | Module-level `PagedStashManager` singleton | Module-level `_PAGED_STASH_REGISTRY` dict (buffer_id → PagedStashBuffer) | Both use module-level state external to graph |
+| **NCCL cleanup** | Natural eager lifecycle | `unregister_paged_stash_buffer` in `close()` | Clean |
 
 ### Open Questions and Future Work
 
@@ -1052,12 +1153,6 @@ approach does not have. Now fixed.
   `PP_PreScheduleFunction` / `PP_PostScheduleFunction` for schedule-driven stash/reload,
   PP-aware buffer sizing from observed runtime interleaving (increment/decrement counters
   across microbatches), and schedule-driven prefetch in backward.
-
-- **Buffer sizing from post-partition counts** (partially resolved): The
-  `PagedStashObserver` now sizes buffers from observed runtime usage during warmup. The
-  initial static allocation (`create_paged_buffers`) still over-allocates, but this is
-  corrected after the observation iteration. A future improvement could skip the initial
-  static allocation entirely and allocate only after observation.
 
 - **Async stream overlap in CUDA graphs** (resolved): Implemented using
   `torch.ops.streams.*` FX graph ops (fork/join/event pattern from PyTorch's
@@ -1071,9 +1166,7 @@ approach does not have. Now fixed.
   `_apply_paged_stash_must_save` uses `classify_nodes` backward-usage analysis to
   selectively apply `MUST_SAVE` only for annotated nodes that are dynamically shaped
   (SymInt) AND have real backward tensor usages. Static-shaped annotated nodes (cheap
-  ops like `silu`/`mul`) are left to SAC's cost-based decisions. With concrete shapes,
-  SAC saves expensive ops (`_grouped_mm`) and recomputes cheap ones. With SymInt shapes,
-  all dynamic annotated ops with backward usages get `MUST_SAVE`.
+  ops like `silu`/`mul`) are left to SAC's cost-based decisions.
 
 - **FP8/MXFP8 extension** (works, optimization pending): MXFP8 paged stash runs
   correctly today — stashing bf16 activations. torchao's `_MXFP8GroupedMM` is opaque
@@ -1082,14 +1175,156 @@ approach does not have. Now fixed.
   quantize/dequantize at stash boundaries in the FX graph, or (2) upstream changes
   to torchao to make `_MXFP8GroupedMM` traceable via `torch.library` custom ops.
 
-- **Runtime buffer observation** (resolved): torchtitan now uses `PagedStashObserver`
-  with `on_copy`/`on_pop` in the paged stash custom ops (mirrors Megatron's
-  `on_save_for_backward`/`on_get_saved_tensor`). During CUDAGraph warmup (step 1),
-  the observer records actual/avg token counts. `allocate_stash_buffers` resizes
-  buffers from observed peak before capture (step 2). Memory reduced from 5.75 to
-  5.52 GiB on the debugmodel.
+- **Module-level buffer registry** (resolved): Buffer tensors are accessed via
+  `_PAGED_STASH_REGISTRY[buffer_id]` at runtime. The FX graph only carries integer
+  `buffer_id` constants — no buffer tensors as `get_attr` nodes or placeholders.
+  This follows the `ao::offload` pattern and eliminates the deepcopy disconnection
+  issue that plagued the earlier `register_buffer` approach (AOT autograd's deepcopy
+  of `bw_module` created disconnected buffer copies).
+
+- **3-level overflow defense** (resolved): Mirrors Megatron's approach — host
+  spillover (Triton kernel data-dependent branch), cross-rank `all_reduce` detection,
+  and retry with buffer grow + CUDA graph reset. Numerics validated: paged stash
+  produces identical loss to baseline SAC (10 steps, `--debug.seed=42
+  --debug.deterministic`, 5-digit match on loss and grad_norm at every step).
 
 - **Extending to other regions**: To stash activations from additional MoE components
   (shared experts, router), apply `annotate_fn({"paged_stash": True})` to the target
   function and ensure `create_paged_buffers` creates buffer keys for the new
   `(dtype, hidden_size)` combinations. No changes to the graph pass logic needed.
+
+## Comparative Analysis: Paged Stash vs ao CPU Offload (PR #2879)
+
+Paged stash reuses ao's stream infrastructure and follows the same joint-graph pass
+architecture as PR #2879's `cpu_offload_pass`. This section provides a one-to-one
+mapping showing shared infrastructure and differences.
+
+### Op-Level Comparison
+
+#### Copy: `paged_stash::copy` vs `ao::offload`
+
+| Aspect | `ao::offload` | `paged_stash::copy` | Same? |
+|---|---|---|---|
+| Purpose | D2H activation save to CPU | Scatter-copy into paged CUDA buffer | Different target |
+| Transfer mechanism | `copy_(non_blocking=True)` via DMA | Triton scatter kernel on SMs | Different |
+| Transfer stream | `_get_or_create_transfer_stream` | Reused from ao | **Same** |
+| Event registration | `_register_wait(result, device)` | Reused from ao | **Same** |
+| Stream pattern | `set_stream → work → record_event → set_stream` | Same | **Same** |
+| Output | CPU pinned tensor (same shape as input) | `(page_record, new_head)` — small int64 | Different |
+| Mutable state | None | `free_list_head.copy_()` on transfer stream | Different |
+| Host fallback | N/A (always goes to host) | Triton `tl.store` to pinned memory | Different |
+| CUDA graph compatible | Yes (`copy_` captured) | Yes (Triton kernel captured) | **Same** |
+
+#### Pop: `paged_stash::pop` vs `ao::reload`
+
+| Aspect | `ao::reload` | `paged_stash::pop` | Same? |
+|---|---|---|---|
+| Purpose | H2D activation restore from CPU | Gather-copy from paged buffer | Different target |
+| Output allocation | Compute stream before switch (allocator ownership) | Same pattern | **Same** |
+| Transfer mechanism | `copy_(non_blocking=True)` via DMA | Triton gather kernel on SMs | Different |
+| Event registration | `_register_wait(result, device)` | Reused from ao | **Same** |
+| Mutable state | None | `free_list_tail.copy_()` on transfer stream | Different |
+
+#### Wait: `ao::wait_tensor` (shared)
+
+| Aspect | Used by ao | Used by paged stash | Same? |
+|---|---|---|---|
+| Op definition | `Library("ao", "DEF")`, aliasing `Tensor(a) → Tensor(a)` | Same op reused directly | **Same** |
+| `has_side_effect` | Yes (prevents DCE) | Same | **Same** |
+| `keepalive` param | Extends GPU tensor lifetime past async D2H | Extends activation lifetime past async copy | **Same pattern** |
+| Dispatch key | `CompositeExplicitAutograd` | Same | **Same** |
+
+Paged stash does not define its own `wait_tensor` op. It imports and reuses
+`torch.ops.ao.wait_tensor.default` directly, registered by the side-effect
+import of `torch._functorch._activation_offloading.offload_ops`.
+
+### Pass-Level Comparison
+
+#### `apply_paged_stash_pass` vs `cpu_offload_pass`
+
+| Aspect | `cpu_offload_pass` (PR #2879) | `apply_paged_stash_pass` | Same? |
+|---|---|---|---|
+| Pass type | Joint-graph pass (before min_cut) | Same | **Same** |
+| Fwd/bwd classification | `seq_nr` (first occurrence → fwd) | Same | **Same** |
+| Node selection | `_can_offload_node` + bwd consumer check | Annotation + dynamic dim + buffer key + bwd consumer | Different criteria |
+| Last-layer skip | Yes (`max(all_layer_ids)`) | No (all annotated layers eligible) | Different |
+| Size threshold | 4KB minimum | None (paged buffer handles all sizes) | Different |
+| View/collective exclusion | Yes (`_VIEW_OPS`, `_COLLECTIVE_OPS`) | No (annotation-based selection is precise) | Different |
+| Fwd insertion | `offload(node)` → `wait_tensor(offload, node)` | `copy(node, …)` → `getitem(copy, 0)` → `wait_tensor(page_record, node)` | **Same pattern** |
+| Bwd insertion | `reload(wait_offload, device)` → `wait_tensor(reload)` | `pop(wait_copy, …)` → `wait_tensor(pop)` | **Same pattern** |
+| Consumer redirection | `replace_input_with(node, wait_node)` | Same | **Same** |
+| Scheduling (wait sinking) | TODO (not implemented) | TODO (interleaved joint graph complicates simple sinking) | Both TODO |
+| Recompute tags | `MUST_CPU_OFFLOAD` | `MUST_SAVE` on wait_tensor nodes (bypasses partitioner impure-op check) | Different |
+| Integration | Registered in `AVAILABLE_JOINT_PASSES` | Bound via `functools.partial` (needs `paged_buffers`) | Different binding |
+
+### Shared Infrastructure
+
+Both systems share:
+
+1. **ao's `_transfer_streams` dict** — one `torch.Stream` per device, lazily created.
+   Paged stash imports `_get_or_create_transfer_stream` from
+   `torch._functorch._activation_offloading.offload_ops`.
+
+2. **ao's `_wait_registry` dict** — maps `data_ptr()` → `(Event, device)`,
+   populated by `_register_wait` inside ops, consumed by `ao::wait_tensor`.
+   Paged stash imports `_register_wait` from the same module.
+
+3. **`ao::wait_tensor` op** — aliasing schema `Tensor(a) → Tensor(a)`,
+   `has_side_effect`, `CompositeExplicitAutograd` dispatch key. Used directly
+   by paged stash (no `paged_stash::wait_tensor`).
+
+4. **Joint-graph pass architecture** — `seq_nr` classification, forward insertion
+   after the producer, backward insertion before the first consumer,
+   `replace_input_with` for consumer redirection.
+
+5. **`torch.accelerator.set_stream` pattern** — imperative stream switching inside
+   ops for CUDA-graph-compatible multi-stream execution.
+
+### TODO: Scheduling optimizations for compute-copy overlap
+
+Both paged stash and PR #2879's `cpu_offload_pass` place `ao.wait_tensor` immediately
+after the copy/offload op. This means the compute stream blocks right away — there is
+no overlap between the async transfer and subsequent compute.
+
+PR #2879's TODO states: "Add scheduling optimizations (defer offload waits, prefetch
+reloads) for D2H/H2D overlap with compute. The make_fx traced joint graph interleaves
+forward and backward nodes (unlike manually built graphs where they are cleanly
+separated), so the simple 'defer to next layer's forward' / 'prefetch to preceding
+layer's backward' strategy from the reference implementation needs adaptation."
+
+The same limitation applies to paged stash. The infrastructure for overlap is in place:
+- Copy/pop kernels launch on a dedicated transfer stream
+- Completion events are recorded and registered in ao's `_wait_registry`
+- `ao.wait_tensor` synchronizes the compute stream when called
+
+To achieve actual overlap, a scheduling pass must defer `ao.wait_tensor` nodes in
+the partitioned forward graph (sink them toward the output) and prefetch pop nodes
+in the backward graph (move them earlier). This is a post-partition compiler pass —
+it cannot be done on the joint graph because the joint graph interleaves fwd/bwd
+nodes in a way that makes "end of forward region" hard to identify topologically.
+
+### Why Paged Stash Uses Triton, Not `copy_`
+
+`ao::offload/reload` uses `copy_(non_blocking=True)`, which maps to `cudaMemcpyAsync`
+on the DMA engine. This achieves true DMA-compute overlap: the DMA engine copies data
+between CPU and GPU while SMs run compute kernels independently.
+
+Paged stash uses Triton kernels instead because:
+
+1. **Non-contiguous scatter/gather**: Activations are scattered into paged slots
+   (not contiguous memory). `copy_` requires contiguous source/destination.
+   The Triton kernel handles the page-table indirection.
+
+2. **Data-dependent host fallback**: When CUDA pages are exhausted, the Triton
+   kernel branches to a pinned host buffer using `tl.store`/`tl.load`. This
+   branching is data-dependent (based on free list state at runtime) and happens
+   inside the kernel — CUDA-graph compatible. Using `ao::offload` would require
+   Python-level branching, which breaks CUDA graph capture.
+
+3. **Free list management**: The kernel atomically allocates/frees pages from
+   a circular free list. This state management is tightly coupled with the copy.
+
+The tradeoff: Triton kernels run on SMs, not the DMA engine, so the "overlap"
+is SM parallelism (multiple kernels on different SMs) rather than DMA-compute
+parallelism. For the CUDA-buffer path this is less beneficial than DMA overlap,
+but it enables the paged memory management that is the core value proposition.
