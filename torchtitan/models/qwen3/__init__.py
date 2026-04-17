@@ -32,6 +32,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Qwen3Model, Qwen3TransformerBlock
 from .parallelize import parallelize_qwen3
+from .sharding import set_qwen3_sharding_spec
 from .state_dict_adapter import Qwen3StateDictAdapter
 
 __all__ = [
@@ -711,7 +712,7 @@ def model_registry(flavor: str) -> ModelSpec:
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_qwen3,
-        set_sharding_spec_fn=None,
+        set_sharding_spec_fn=set_qwen3_sharding_spec,
         pipelining_fn=pipeline_llm,
         build_loss_fn=build_cross_entropy_loss,
         post_optimizer_build_fn=None,
