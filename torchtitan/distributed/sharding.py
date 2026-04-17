@@ -7,7 +7,7 @@
 from torch.distributed.tensor import Placement, Replicate, Shard
 
 from torchtitan.models.common.attention import FusedQKVLinear, GQAttention, QKVLinear
-from torchtitan.protocols.sharding import MeshDimName, ShardingSpec
+from torchtitan.protocols.sharding import LocalMapSpec, MeshDimName, ShardingSpec
 
 TP = MeshDimName.TP
 
@@ -70,7 +70,9 @@ def set_qkv_linear_sharding(qkv_linear_cfg) -> None:
         )
 
 
-def set_gqa_attention_sharding(attention_cfg, *, enable_sp: bool) -> None:
+def set_gqa_attention_sharding(
+    attention_cfg, *, enable_sp: bool, include_positions: bool = False
+) -> None:
     """Standard GQA attention (``qkv_linear``/``wo``) TP sharding.
 
     Shared by llama3, qwen3, and llama4 — all three have a GQA block whose
@@ -79,24 +81,56 @@ def set_gqa_attention_sharding(attention_cfg, *, enable_sp: bool) -> None:
 
     Callers that have additional attention sub-state (e.g. ``qk_norm``,
     ``sinks``) set those after calling this helper.
+
+    ``include_positions=True`` annotates the optional ``positions`` argument
+    as ``Replicate`` on TP. The generator path (vLLM inference) passes
+    ``positions`` explicitly; training paths leave it ``None``.
     """
     assert isinstance(attention_cfg, GQAttention.Config), (
         f"set_gqa_attention_sharding requires GQAttention.Config, "
         f"got {type(attention_cfg).__name__}"
     )
     attn_x_placement: Placement = Shard(1) if enable_sp else Replicate()
+    input_layouts: dict = {
+        "x": {TP: attn_x_placement},
+        "rope_cache": {TP: Replicate()},
+    }
+    in_shardings: dict = {
+        "x": {TP: Replicate()},
+        "rope_cache": {TP: Replicate()},
+    }
+    if include_positions:
+        input_layouts["positions"] = {TP: Replicate()}
+        in_shardings["positions"] = {TP: Replicate()}
     attention_cfg.sharding_spec = ShardingSpec(
-        input_layouts={
-            "x": {TP: attn_x_placement},
-            "rope_cache": {TP: Replicate()},
-        },
-        in_shardings={
-            "x": {TP: Replicate()},
-            "rope_cache": {TP: Replicate()},
-        },
+        input_layouts=input_layouts,
+        in_shardings=in_shardings,
     )
     set_qkv_linear_sharding(attention_cfg.qkv_linear)
     attention_cfg.wo.sharding_spec = rowwise_spec(output_sp=enable_sp)
+
+
+def set_gqa_inner_attention_local_map(
+    inner_attention_cfg, *, num_outputs: int = 1
+) -> None:
+    """Install a ``LocalMapSpec`` on an inner-attention config.
+
+    q/k/v arrive as ``(bs, seq, heads, head_dim)`` DTensors with heads
+    TP-sharded (``Shard(2)``), regardless of SP. ``local_map`` converts them
+    to local tensors before the kernel runs, then wraps outputs back.
+
+    ``num_outputs`` controls the number of tensor outputs: 1 for the usual
+    (attn_out) case; 2 for kernels that return ``(output, lse)`` like
+    GPT-OSS's flash attention with ``return_lse=True``.
+    """
+    qkv_placements = (Shard(2),)
+    inner_attention_cfg.sharding_spec = ShardingSpec(
+        local_map=LocalMapSpec(
+            in_placements=(qkv_placements, qkv_placements, qkv_placements),
+            out_placements=(qkv_placements,) * num_outputs,
+            in_grad_placements=(qkv_placements, qkv_placements, qkv_placements),
+        ),
+    )
 
 
 def set_dense_ffn_sharding(

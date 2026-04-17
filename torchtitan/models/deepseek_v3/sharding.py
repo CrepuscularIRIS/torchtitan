@@ -16,9 +16,10 @@ from torchtitan.distributed.sharding import (
     sequence_parallel_spec,
     set_decoder_sharding_spec,
     set_dense_ffn_sharding,
+    set_gqa_inner_attention_local_map,
 )
 from torchtitan.models.deepseek_v3.model import Attention
-from torchtitan.protocols.sharding import LocalMapSpec, MeshDimName, ShardingSpec
+from torchtitan.protocols.sharding import MeshDimName, ShardingSpec
 
 TP = MeshDimName.TP
 
@@ -88,17 +89,7 @@ def _set_deepseek_v3_layer_sharding(
     attention.wkv_b.sharding_spec = colwise_spec()
     attention.wo.sharding_spec = rowwise_spec(output_sp=enable_sp)
 
-    # Inner attention: local_map to convert TP DTensors to local tensors.
-    # MLA: q/k/v are (bs, seq, heads, head_dim) — no transpose, heads at dim 2.
-    # Heads are TP-sharded regardless of SP.
-    qkv_placements = (Shard(2),)
-    attention.inner_attention.sharding_spec = ShardingSpec(
-        local_map=LocalMapSpec(
-            in_placements=(qkv_placements, qkv_placements, qkv_placements),
-            out_placements=(qkv_placements,),
-            in_grad_placements=(qkv_placements, qkv_placements, qkv_placements),
-        ),
-    )
+    set_gqa_inner_attention_local_map(attention.inner_attention)
 
     # Query projection: depends on q_lora_rank
     if attention.q_lora_rank == 0:
