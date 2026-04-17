@@ -160,13 +160,19 @@ def pipeline_llm(
 
     # Config-based TP keeps DTensors on the PP boundary. The PipelineStage
     # strips DTensors to local tensors for P2P send and reconstructs them on
-    # recv by looking up the mesh in its ``_mesh_cache``. Register the TP
-    # mesh so the reconstruction can find it.
-    if parallel_dims.tp_enabled:
-        tp_mesh = parallel_dims.get_mesh("tp")
+    # recv by looking up the mesh in its ``_mesh_cache``. Register the mesh
+    # that carries those DTensors so the reconstruction can find it.
+    pp_dtensor_mesh: DeviceMesh | None = None
+    if training.full_dtensor:
+        from torchtitan.distributed.full_dtensor import get_dense_spmd_mesh
+
+        pp_dtensor_mesh = get_dense_spmd_mesh(parallel_dims)
+    elif parallel_dims.tp_enabled:
+        pp_dtensor_mesh = parallel_dims.get_mesh("tp")
+    if pp_dtensor_mesh is not None:
         for stage in stages:
             stage._mesh_cache._get_mesh_cb = (
-                lambda names, layout: tp_mesh  # pyrefly: ignore[bad-assignment]
+                lambda names, layout: pp_dtensor_mesh  # pyrefly: ignore[bad-assignment]
             )
 
     pp_schedule = build_pipeline_schedule(
